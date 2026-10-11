@@ -10,7 +10,7 @@
 set -u
 shopt -s extglob
 export LC_ALL=C
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
   echo "sysmon: bash 4.3+ required (found $BASH_VERSION)" >&2
@@ -117,6 +117,7 @@ root_disk() {
   echo "$base"
 }
 ROOT_DISK=$(root_disk)
+DEFAULT_IFACE=$(awk '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null)
 
 # ---------- formatting helpers ----------
 fmt_b() {
@@ -179,6 +180,7 @@ declare -A PRE_PROC_TICKS CUR_PROC_TICKS
 declare -A PRE_GPU_VRAM CUR_GPU_VRAM PRE_GPU_GTT CUR_GPU_GTT
 declare -A PRE_GPU_ENG CUR_GPU_ENG PRE_GPU_EV CUR_GPU_EV
 declare -A PRE_GPU_ENGINES CUR_GPU_ENGINES
+declare -A PRE_NET_RX CUR_NET_RX PRE_NET_TX CUR_NET_TX
 declare -A PRE_THREAD_TICKS CUR_THREAD_TICKS PRE_THREAD_COMM CUR_THREAD_COMM
 for v in CPU_TOTAL CPU_IDLE CPU_IOWAIT DISK_R DISK_W PTICKS PREAD PWRITE ENGINE PV RAM PGT PEV; do
   for t in PRE CUR; do eval "${t}_${v}=0"; done
@@ -213,6 +215,7 @@ snapshot_system() {  # $1=tag
   local tag=$1 p stat rest f
   cpu_part "$tag"
   disk_part "$tag"
+  snapshot_net "$tag"
   local -n procs="${tag}_PROC_TICKS"
   procs=()
   for p in /proc/[0-9]*; do
@@ -238,6 +241,26 @@ snapshot_system() {  # $1=tag
     gvram[$gp]=$v; ggtt[$gp]=$g; geng[$gp]=$e; gev[$gp]=$ev
     gengines[$gp]=$engs
   done < <(grep -l -m1 '^drm-client-id:' /proc/[0-9]*/fdinfo/* 2>/dev/null)
+}
+
+snapshot_net() {  # $1=tag; collects per-interface rx/tx byte counters
+  local -n nrx="${1}_NET_RX" ntx="${1}_NET_TX"
+  nrx=(); ntx=()
+  local iface r t
+  while read -r iface r t; do
+    [[ $iface == lo ]] && continue
+    nrx[$iface]=$r; ntx[$iface]=$t
+  done < <(awk 'NR>2 {gsub(/^[ \t]+/, ""); split($0, p, /[ \t]+/); sub(/:$/, "", p[1]); print p[1], p[2], p[10]}' /proc/net/dev 2>/dev/null)
+}
+
+proc_sockets() {  # $1=pid -> "total established listen udp"
+  awk '
+    FNR==NR { gsub(/[^0-9]/, "", $0); if ($0 != "") { want[$0]=1; total++ } next }
+    FILENAME ~ /udp/ { if ($10 in want) u++; next }
+    FILENAME ~ /tcp/ { if ($10 in want) { if ($4=="01") e++; else if ($4=="0A") l++ } }
+    END { printf "%d %d %d %d\n", total+0, e+0, l+0, u+0 }
+  ' <(find /proc/"$1"/fd -maxdepth 1 -type l -lname 'socket:*' -printf '%l\n' 2>/dev/null) \
+    /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null
 }
 
 proc_gpu() {  # $1=pid -> "vram_kib gtt_kib engine_ns evicted_kib"
@@ -518,6 +541,23 @@ render_system() {
   add 'DISK  %s   read %s/s   write %s/s' "$ROOT_DISK" \
     "$(fmt_b "$(rate_b $(( CUR_DISK_R - PRE_DISK_R )) "$ELAPSED_NS" 512)")" \
     "$(fmt_b "$(rate_b $(( CUR_DISK_W - PRE_DISK_W )) "$ELAPSED_NS" 512)")"
+  local netline="" iface rxd txd
+  while read -r iface rxd txd; do
+    [[ -n $iface ]] || continue
+    if (( rxd > 0 || txd > 0 )) || { [[ -z $netline && $iface == "$DEFAULT_IFACE" ]]; }; then
+      netline+="$iface rx $(fmt_b "$(rate_b "$rxd" "$ELAPSED_NS")")/s  tx $(fmt_b "$(rate_b "$txd" "$ELAPSED_NS")")/s   "
+    fi
+  done < <(
+    for iface in "${!CUR_NET_RX[@]}"; do
+      rxd=$(( ${CUR_NET_RX[$iface]:-0} - ${PRE_NET_RX[$iface]:-${CUR_NET_RX[$iface]:-0}} ))
+      txd=$(( ${CUR_NET_TX[$iface]:-0} - ${PRE_NET_TX[$iface]:-${CUR_NET_TX[$iface]:-0}} ))
+      (( rxd < 0 )) && rxd=0
+      (( txd < 0 )) && txd=0
+      echo "$iface $(( rxd + txd )) $rxd $txd"
+    done | sort -k2,2rn | cut -d' ' -f1,3,4
+  )
+  [[ -n $netline ]] || netline="idle"
+  add 'NET   %s' "$netline"
   add 'TEMP  CPU %s   GPU %s   NVMe %s' "$(temp_c "$(read_temp "$HWM_CPU")")" "$(temp_c "$(read_temp "$HWM_GPU")")" "$(temp_c "$(read_temp "$HWM_NVME")")"
   add ''
   add '%sTOP CPU%s  (last %ss)' "$C_BOLD" "$C_RESET" "$INTERVAL"
@@ -652,6 +692,9 @@ render_proc() {
   add 'DISK  read %s/s   write %s/s' \
     "$(fmt_b "$(rate_b $(( CUR_PREAD - PRE_PREAD )) "$ELAPSED_NS")")" \
     "$(fmt_b "$(rate_b $(( CUR_PWRITE - PRE_PWRITE )) "$ELAPSED_NS")")"
+  local stotal sest slis sudp
+  read -r stotal sest slis sudp < <(proc_sockets "$pid")
+  add 'NET   sockets %s (established %s, listen %s, udp %s)' "$stotal" "$sest" "$slis" "$sudp"
   local sbusy=$(( (CUR_CPU_TOTAL-CUR_CPU_IDLE) - (PRE_CPU_TOTAL-PRE_CPU_IDLE) )) sdt=$(( CUR_CPU_TOTAL - PRE_CPU_TOTAL ))
   local sb_pct
   sb_pct=$(pct10 "$sbusy" "$sdt")
@@ -731,6 +774,8 @@ while :; do
     PRE_GPU_ENG=(); for k in "${!CUR_GPU_ENG[@]}"; do PRE_GPU_ENG[$k]=${CUR_GPU_ENG[$k]}; done
     PRE_GPU_EV=(); for k in "${!CUR_GPU_EV[@]}"; do PRE_GPU_EV[$k]=${CUR_GPU_EV[$k]}; done
     PRE_GPU_ENGINES=(); for k in "${!CUR_GPU_ENGINES[@]}"; do PRE_GPU_ENGINES[$k]=${CUR_GPU_ENGINES[$k]}; done
+    PRE_NET_RX=(); for k in "${!CUR_NET_RX[@]}"; do PRE_NET_RX[$k]=${CUR_NET_RX[$k]}; done
+    PRE_NET_TX=(); for k in "${!CUR_NET_TX[@]}"; do PRE_NET_TX[$k]=${CUR_NET_TX[$k]}; done
   fi
   PRE_NS=$CUR_NS
 done
