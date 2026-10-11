@@ -8,6 +8,7 @@
 # Sources: /proc, /sys (DRM sysfs + per-process fdinfo), hwmon, /proc/pressure.
 # Requirements: Linux, bash >= 4.3.
 set -u
+shopt -s extglob
 export LC_ALL=C
 VERSION="0.4.0"
 
@@ -352,6 +353,24 @@ proc_swap_kb() { awk '/^VmSwap:/{print $2; exit}' /proc/"$1"/status 2>/dev/null;
 
 # ---------- rendering ----------
 tty_ok=0; [[ -t 1 ]] && tty_ok=1
+TERM_COLS=80; TERM_LINES=24; ROWS_CPU=5; ROWS_GPU=5
+update_layout() {
+  if (( tty_ok )); then
+    TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+    TERM_LINES=$(tput lines 2>/dev/null || echo 24)
+  else
+    TERM_COLS=10000; TERM_LINES=200
+  fi
+  [[ $TERM_COLS =~ ^[0-9]+$ ]] || TERM_COLS=80
+  [[ $TERM_LINES =~ ^[0-9]+$ ]] || TERM_LINES=24
+  (( TERM_COLS < 40 )) && TERM_COLS=40
+  (( TERM_LINES < 12 )) && TERM_LINES=12
+  local avail=$(( TERM_LINES - 18 ))
+  (( avail < 2 )) && avail=2
+  ROWS_CPU=$(( avail / 2 ))
+  (( ROWS_CPU > 5 )) && ROWS_CPU=5
+  ROWS_GPU=$ROWS_CPU
+}
 USE_COLOR=0
 if [[ $COLOR_MODE == always ]]; then
   USE_COLOR=1
@@ -404,6 +423,33 @@ hbar() {  # $1 percent, $2 width
 }
 FRAME=""
 add() { local ln; printf -v ln "$@"; FRAME+="$ln"$'\n'; }
+
+clip_line() {  # $1 = line with ANSI codes, $2 = max visible chars
+  local s=$1 max=$2 out="" i=0 n=0 len=${#1} c seq
+  while (( i < len )); do
+    c=${s:i:1}
+    if [[ $c == $'\033' ]]; then
+      seq=$c; (( i++ ))
+      while (( i < len )); do
+        c=${s:i:1}; seq+=$c; (( i++ ))
+        [[ $c == [a-zA-Z] ]] && break
+      done
+      out+=$seq
+    else
+      (( n >= max )) && break
+      out+=$c; (( n++ )); (( i++ ))
+    fi
+  done
+  printf '%s%s' "$out" "$C_RESET"
+}
+
+emit_frame() {  # single write, line-by-line truncation, no stale fragments
+  local out="" line
+  while IFS= read -r line; do
+    out+="$(clip_line "$line" $(( TERM_COLS - 1 )))"$'\033[K\n'
+  done <<< "$FRAME"
+  printf '\033[?2026h\033[H%s\033[J\033[?2026l' "$out"
+}
 
 render_header() {
   local up days h m l1 l2 l3 clock
@@ -487,7 +533,7 @@ render_system() {
       [[ -n ${PRE_PROC_TICKS[$pid]+x} ]] || continue
       d=$(( CUR_PROC_TICKS[$pid] - PRE_PROC_TICKS[$pid] ))
       (( d > 0 )) && echo "$(awk -v d="$d" -v e="$e" 'BEGIN{printf "%d", d*1000/e}') $pid"
-    done | sort -rn | head -5
+    done | sort -rn | head -"$ROWS_CPU"
   )
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     add ''
@@ -526,7 +572,7 @@ render_system() {
         else
           echo "${CUR_GPU_VRAM[$pid]:-0} 0 $pid"
         fi
-      done | sort -k1,1rn -k2,2rn | head -5
+      done | sort -k1,1rn -k2,2rn | head -"$ROWS_GPU"
     )
   fi
 }
@@ -583,7 +629,7 @@ render_proc() {
       [[ -n ${PRE_THREAD_TICKS[$tid]+x} ]] || continue
       d=$(( CUR_THREAD_TICKS[$tid] - PRE_THREAD_TICKS[$tid] ))
       (( d > 0 )) && echo "$(awk -v d="$d" -v e="$e" 'BEGIN{printf "%d", d*1000/e}') $tid"
-    done | sort -rn | head -5
+    done | sort -rn | head -"$ROWS_CPU"
   )
   (( trows > 0 )) || add '  %s(no thread activity in this interval)%s' "$C_DIM" "$C_RESET"
   local vu vt gu gt
@@ -652,12 +698,13 @@ while :; do
   CUR_NS=$(date +%s%N)
   ELAPSED_NS=$(( CUR_NS - PRE_NS )); (( ELAPSED_NS > 0 )) || ELAPSED_NS=1000000000
   FRAME=""
+  update_layout
   render_header
   if [[ -n $TARGET ]]; then render_proc "$pid"; else render_system; fi
   render_footer
   if (( tty_ok )); then
-    # one write per frame + synchronized update: no flicker
-    printf '\033[?2026h\033[H%s\033[J\033[?2026l' "$FRAME"
+    # one write per frame, clipped to the window, erase-to-EOL per line
+    emit_frame
   else
     printf '%s' "$FRAME"
     printf '%s\n' '----------------------------------------'
