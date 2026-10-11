@@ -9,7 +9,7 @@
 # Requirements: Linux, bash >= 4.3.
 set -u
 export LC_ALL=C
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
   echo "sysmon: bash 4.3+ required (found $BASH_VERSION)" >&2
@@ -177,10 +177,12 @@ declare -a PRE_CORES CUR_CORES PRE_GPU_PIDS CUR_GPU_PIDS
 declare -A PRE_PROC_TICKS CUR_PROC_TICKS
 declare -A PRE_GPU_VRAM CUR_GPU_VRAM PRE_GPU_GTT CUR_GPU_GTT
 declare -A PRE_GPU_ENG CUR_GPU_ENG PRE_GPU_EV CUR_GPU_EV
+declare -A PRE_GPU_ENGINES CUR_GPU_ENGINES
 declare -A PRE_THREAD_TICKS CUR_THREAD_TICKS PRE_THREAD_COMM CUR_THREAD_COMM
 for v in CPU_TOTAL CPU_IDLE CPU_IOWAIT DISK_R DISK_W PTICKS PREAD PWRITE ENGINE PV RAM PGT PEV; do
   for t in PRE CUR; do eval "${t}_${v}=0"; done
 done
+PRE_PENGINES=""; CUR_PENGINES=""
 
 cpu_part() {  # $1=tag
   local line first=1
@@ -220,7 +222,8 @@ snapshot_system() {  # $1=tag
   done
   local -n gpids="${tag}_GPU_PIDS" gvram="${tag}_GPU_VRAM" ggtt="${tag}_GPU_GTT"
   local -n geng="${tag}_GPU_ENG" gev="${tag}_GPU_EV"
-  gpids=(); gvram=(); ggtt=(); geng=(); gev=()
+  local -n gengines="${tag}_GPU_ENGINES"
+  gpids=(); gvram=(); ggtt=(); geng=(); gev=(); gengines=()
   (( GPU_TOP )) || return 0
   local fd gp seen=" " v g e ev
   while IFS= read -r fd; do
@@ -228,9 +231,11 @@ snapshot_system() {  # $1=tag
     [[ $seen == *" $gp "* ]] && continue
     seen+="$gp "
     [[ -r /proc/$gp/fdinfo ]] || continue
-    read -r v g e ev < <(proc_gpu "$gp")
+    local engs
+    read -r v g e ev engs < <(proc_gpu "$gp")
     gpids+=("$gp")
     gvram[$gp]=$v; ggtt[$gp]=$g; geng[$gp]=$e; gev[$gp]=$ev
+    gengines[$gp]=$engs
   done < <(grep -l -m1 '^drm-client-id:' /proc/[0-9]*/fdinfo/* 2>/dev/null)
 }
 
@@ -239,18 +244,34 @@ proc_gpu() {  # $1=pid -> "vram_kib gtt_kib engine_ns evicted_kib"
     /^drm-client-id:/ {cid=$2}
     /^drm-memory-vram:/ {if(cid!="" && !(cid in v)) v[cid]=$2+0}
     /^drm-memory-gtt:/  {if(cid!="" && !(cid in g)) g[cid]=$2+0}
-    /^drm-engine-gfx:/  {if(cid!="" && !(cid in eg)) eg[cid]=$2+0}
-    /^drm-engine-render:/{if(cid!="" && !(cid in er)) er[cid]=$2+0}
+    /^drm-engine-/ {
+      if (cid != "") {
+        name=$1; sub(/^drm-engine-/, "", name); sub(/:$/, "", name)
+        key=cid SUBSEP name
+        if (!(key in em)) em[key]=$2+0
+      }
+    }
     /^amd-evicted-vram:/{if(cid!="" && !(cid in ev)) ev[cid]=$2+0}
     END{
       tv=tg=te=tev=0
       for(c in v)tv+=v[c]; for(c in g)tg+=g[c]
-      for(c in eg)te+=eg[c]
-      if(te==0) for(c in er)te+=er[c]
       for(c in ev)tev+=ev[c]
-      printf "%d %d %d %d\n", tv, tg, te, tev
+      eng=""
+      for(k in em){split(k,a,SUBSEP); te+=em[k]; eng=eng a[2] ":" em[k] " "}
+      printf "%d %d %d %d %s\n", tv, tg, te, tev, eng
     }
   ' /proc/"$1"/fdinfo/* 2>/dev/null
+}
+
+engine_deltas() {  # $1=prev "name:ns ..." $2=cur -> "name ns" for positive deltas
+  local -A P=() C=()
+  local kv name d
+  for kv in $1; do P[${kv%%:*}]=${kv#*:}; done
+  for kv in $2; do C[${kv%%:*}]=${kv#*:}; done
+  for name in "${!C[@]}"; do
+    d=$(( C[$name] - ${P[$name]:-${C[$name]}} ))
+    (( d > 0 )) && printf '%s %d\n' "$name" "$d"
+  done
 }
 
 snapshot_proc() {  # $1=tag $2=pid
@@ -260,6 +281,7 @@ snapshot_proc() {  # $1=tag $2=pid
   local -n pticks="${tag}_PTICKS" pread="${tag}_PREAD" pwrite="${tag}_PWRITE"
   local -n threads="${tag}_THREAD_TICKS" comms="${tag}_THREAD_COMM"
   local -n pv="${tag}_PV" pg="${tag}_PGT" pe="${tag}_PEV" peng="${tag}_ENGINE"
+  local -n pengines="${tag}_PENGINES"
   threads=(); comms=()
   IFS= read -r stat 2>/dev/null < /proc/"$pid"/stat || return 1
   rest=${stat#*) }
@@ -274,7 +296,7 @@ snapshot_proc() {  # $1=tag $2=pid
     local c=${stat#*(}; comms[$tid]=${c%%)*}
   done
   read -r pread pwrite < <(awk '$1=="read_bytes:"{r=$2} $1=="write_bytes:"{w=$2} END{print r+0, w+0}' /proc/"$pid"/io 2>/dev/null)
-  read -r pv pg peng pe < <(proc_gpu "$pid")
+  read -r pv pg peng pe pengines < <(proc_gpu "$pid")
 }
 
 # ---------- process resolution ----------
@@ -431,6 +453,22 @@ render_system() {
   add 'GPU   %sVRAM %s%%   %s / %s   GTT %s (%s%%)   temp %s%s' \
     "$barg" "$(hcp "$vram_pct")" "$(fmt_b "$vu")" "$(fmt_b "$vt")" "$(fmt_b "$gu")" "$gtt_pct" \
     "$(temp_c "$(read_temp "$HWM_GPU")")" "$gb"
+  if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
+    local -A engsum=()
+    local epid ename ens
+    for epid in "${CUR_GPU_PIDS[@]}"; do
+      while read -r ename ens; do
+        engsum[$ename]=$(( ${engsum[$ename]:-0} + ens ))
+      done < <(engine_deltas "${PRE_GPU_ENGINES[$epid]:-}" "${CUR_GPU_ENGINES[$epid]:-}")
+    done
+    if (( ${#engsum[@]} > 0 )); then
+      local eline=""
+      while read -r ename ens; do
+        eline+="$ename $(hcp "$(pct10 "$ens" "$ELAPSED_NS")")%   "
+      done < <(for ename in "${!engsum[@]}"; do echo "$ename ${engsum[$ename]}"; done | sort -k2,2rn | head -4)
+      add 'ENGINE  %s' "$eline"
+    fi
+  fi
   add 'DISK  %s   read %s/s   write %s/s' "$ROOT_DISK" \
     "$(fmt_b "$(rate_b $(( CUR_DISK_R - PRE_DISK_R )) "$ELAPSED_NS" 512)")" \
     "$(fmt_b "$(rate_b $(( CUR_DISK_W - PRE_DISK_W )) "$ELAPSED_NS" 512)")"
@@ -551,11 +589,16 @@ render_proc() {
   local vu vt gu gt
   read -r vu vt gu gt < <(gpu_sysfs)
   if (( CUR_PV > 0 )); then
-    local eng_pct pvram_pct
+    local eng_pct pvram_pct eline="" ename ens
     eng_pct=$(pct10 $(( CUR_ENGINE - PRE_ENGINE )) "$ELAPSED_NS")
     pvram_pct=$(( vt ? 100 * (CUR_PV * 1024) / vt : 0 ))
-    add 'GPU   engine %s%%   VRAM %s/%s (%s%%)   GTT %s   evicted %s' \
-      "$(hcp "$eng_pct")" "$(fmt_kib_b "$CUR_PV")" "$(fmt_b "$vt")" "$(hcp "$pvram_pct")" \
+    while read -r ename ens; do
+      eline+="$ename $(hcp "$(pct10 "$ens" "$ELAPSED_NS")")%   "
+    done < <(engine_deltas "$PRE_PENGINES" "$CUR_PENGINES" | sort -k2,2rn | head -4)
+    [[ -n $eline ]] || eline="idle   "
+    add 'GPU   engines %s total %s%%' "$eline" "$(hcp "$eng_pct")"
+    add 'GPU   VRAM %s/%s (%s%%)   GTT %s   evicted %s' \
+      "$(fmt_kib_b "$CUR_PV")" "$(fmt_b "$vt")" "$(hcp "$pvram_pct")" \
       "$(fmt_kib_b "$CUR_PGT")" "$(fmt_kib_b "$CUR_PEV")"
   else
     add 'GPU   no DRM client found   system VRAM %s / %s   GTT %s' "$(fmt_b "$vu")" "$(fmt_b "$vt")" "$(fmt_b "$gu")"
@@ -626,6 +669,7 @@ while :; do
     PRE_CPU_TOTAL=$CUR_CPU_TOTAL; PRE_CPU_IDLE=$CUR_CPU_IDLE; PRE_CPU_IOWAIT=$CUR_CPU_IOWAIT
     PRE_PTICKS=$CUR_PTICKS; PRE_PREAD=$CUR_PREAD; PRE_PWRITE=$CUR_PWRITE
     PRE_ENGINE=$CUR_ENGINE; PRE_PV=$CUR_PV; PRE_PGT=$CUR_PGT; PRE_PEV=$CUR_PEV
+    PRE_PENGINES=$CUR_PENGINES
     PRE_DISK_R=$CUR_DISK_R; PRE_DISK_W=$CUR_DISK_W
     PRE_THREAD_TICKS=(); for k in "${!CUR_THREAD_TICKS[@]}"; do PRE_THREAD_TICKS[$k]=${CUR_THREAD_TICKS[$k]}; done
     PRE_THREAD_COMM=(); for k in "${!CUR_THREAD_COMM[@]}"; do PRE_THREAD_COMM[$k]=${CUR_THREAD_COMM[$k]}; done
@@ -639,6 +683,7 @@ while :; do
     PRE_GPU_GTT=(); for k in "${!CUR_GPU_GTT[@]}"; do PRE_GPU_GTT[$k]=${CUR_GPU_GTT[$k]}; done
     PRE_GPU_ENG=(); for k in "${!CUR_GPU_ENG[@]}"; do PRE_GPU_ENG[$k]=${CUR_GPU_ENG[$k]}; done
     PRE_GPU_EV=(); for k in "${!CUR_GPU_EV[@]}"; do PRE_GPU_EV[$k]=${CUR_GPU_EV[$k]}; done
+    PRE_GPU_ENGINES=(); for k in "${!CUR_GPU_ENGINES[@]}"; do PRE_GPU_ENGINES[$k]=${CUR_GPU_ENGINES[$k]}; done
   fi
   PRE_NS=$CUR_NS
 done
