@@ -15,12 +15,19 @@ TEMP  CPU 42C   GPU 58C   NVMe 54C
 TOP CPU  (last 1s)
   PID          CPU%        RSS  COMMAND
   14594       156.7       2.5G  DyingLightGame
+
+TOP GPU  (engine busy, last 1s)
+  PID          GPU%       VRAM  COMMAND
+  14594        99.0       1.6G  DyingLightGame
+  1484          0.7     101.7M  plasmashell
 ```
 
 ## 特性
 
 - **系统总览**：CPU 总体/每核占用、PSI 压力、内存与 swap、显存 VRAM/GTT、
   磁盘读写、CPU/GPU/NVMe 温度、按 CPU 排序的进程列表。
+- **TOP GPU**：按 GPU 引擎占用排序的进程列表，同时给出每个进程占用的显存；
+  没有引擎计数器时自动改为按显存排序。
 - **进程模式**：按名字或 PID 自动识别进程，显示每线程 CPU、RSS、swap、
   该进程独占的 VRAM/GTT/evicted 显存、GPU 引擎占用率、进程磁盘 I/O。
 - **易读**：百分比按阈值着色（绿 <50%、黄 50-75%、红 75-90%、红底 >=90%），
@@ -67,6 +74,7 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `-n COUNT` | 刷新 COUNT 次后退出，默认一直运行到 Ctrl-C |
 | `-p` | 纯文本输出，便于记日志 |
 | `-c` | 强制彩色输出（非终端时默认关色） |
+| `-G` | 不显示 TOP GPU 进程表（进程多、想省开销时可用） |
 | `-v` | 打印版本 |
 | `-h` | 帮助 |
 
@@ -85,6 +93,7 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `GPU VRAM` | 显存占用；`GTT` 是 GPU 溢出到系统内存的部分 |
 | `busy` | GPU 整体利用率（驱动支持时显示） |
 | `DISK` | 根分区所在磁盘的实时读写速率 |
+| `TOP GPU` | 按 GPU 引擎占用排序的前 5 个进程，附各自的显存占用；无引擎计数器时按显存排序 |
 
 ### 进程模式
 

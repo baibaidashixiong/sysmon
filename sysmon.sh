@@ -9,7 +9,7 @@
 # Requirements: Linux, bash >= 4.3.
 set -u
 export LC_ALL=C
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
   echo "sysmon: bash 4.3+ required (found $BASH_VERSION)" >&2
@@ -25,6 +25,7 @@ COUNT=0
 TARGET=""
 COLOR_MODE=auto
 BARS=1
+GPU_TOP=1
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 PAGE_KB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
 
@@ -41,6 +42,7 @@ Options:
   -n COUNT     refresh COUNT times then exit (default: until Ctrl-C)
   -p           plain output (no colors, no bars)
   -c           force colors even when output is piped
+  -G           skip the TOP GPU process table
   -v           print version
   -h           show this help
 
@@ -51,12 +53,13 @@ Examples:
 EOF
 }
 
-while getopts ":i:n:pcvh" opt; do
+while getopts ":i:n:pcvGh" opt; do
   case $opt in
     i) INTERVAL=$OPTARG ;;
     n) COUNT=$OPTARG ;;
     p) COLOR_MODE=never; BARS=0 ;;
     c) COLOR_MODE=always ;;
+    G) GPU_TOP=0 ;;
     v) echo "sysmon $VERSION"; exit 0 ;;
     h) usage; exit 0 ;;
     \?) echo "unknown option: -$OPTARG" >&2; usage; exit 1 ;;
@@ -170,8 +173,10 @@ psi10() {
 }
 
 # ---------- snapshots ----------
-declare -a PRE_CORES CUR_CORES
+declare -a PRE_CORES CUR_CORES PRE_GPU_PIDS CUR_GPU_PIDS
 declare -A PRE_PROC_TICKS CUR_PROC_TICKS
+declare -A PRE_GPU_VRAM CUR_GPU_VRAM PRE_GPU_GTT CUR_GPU_GTT
+declare -A PRE_GPU_ENG CUR_GPU_ENG PRE_GPU_EV CUR_GPU_EV
 declare -A PRE_THREAD_TICKS CUR_THREAD_TICKS PRE_THREAD_COMM CUR_THREAD_COMM
 for v in CPU_TOTAL CPU_IDLE CPU_IOWAIT DISK_R DISK_W PTICKS PREAD PWRITE ENGINE PV RAM PGT PEV; do
   for t in PRE CUR; do eval "${t}_${v}=0"; done
@@ -213,6 +218,20 @@ snapshot_system() {  # $1=tag
     read -r -a f <<< "$rest"
     procs[${p##*/}]=$(( ${f[11]:-0} + ${f[12]:-0} ))
   done
+  local -n gpids="${tag}_GPU_PIDS" gvram="${tag}_GPU_VRAM" ggtt="${tag}_GPU_GTT"
+  local -n geng="${tag}_GPU_ENG" gev="${tag}_GPU_EV"
+  gpids=(); gvram=(); ggtt=(); geng=(); gev=()
+  (( GPU_TOP )) || return 0
+  local fd gp seen=" " v g e ev
+  while IFS= read -r fd; do
+    gp=${fd#/proc/}; gp=${gp%%/*}
+    [[ $seen == *" $gp "* ]] && continue
+    seen+="$gp "
+    [[ -r /proc/$gp/fdinfo ]] || continue
+    read -r v g e ev < <(proc_gpu "$gp")
+    gpids+=("$gp")
+    gvram[$gp]=$v; ggtt[$gp]=$g; geng[$gp]=$e; gev[$gp]=$ev
+  done < <(grep -l -m1 '^drm-client-id:' /proc/[0-9]*/fdinfo/* 2>/dev/null)
 }
 
 proc_gpu() {  # $1=pid -> "vram_kib gtt_kib engine_ns evicted_kib"
@@ -432,6 +451,46 @@ render_system() {
       (( d > 0 )) && echo "$(awk -v d="$d" -v e="$e" 'BEGIN{printf "%d", d*1000/e}') $pid"
     done | sort -rn | head -5
   )
+  if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
+    add ''
+    local engine_total=0
+    for pid in "${CUR_GPU_PIDS[@]}"; do
+      [[ -n ${PRE_GPU_ENG[$pid]+x} ]] || continue
+      d=$(( CUR_GPU_ENG[$pid] - PRE_GPU_ENG[$pid] ))
+      (( d > 0 )) && engine_total=$(( engine_total + d ))
+    done
+    local use_engine=0; (( engine_total > 0 )) && use_engine=1
+    if (( use_engine )); then
+      add '%sTOP GPU%s  (engine busy, last %ss)' "$C_BOLD" "$C_RESET" "$INTERVAL"
+      add '%s  %-8s %8s %10s  %s%s' "$C_DIM" PID GPU% VRAM COMMAND "$C_RESET"
+    else
+      add '%sTOP GPU%s  (by VRAM; no engine counters)' "$C_BOLD" "$C_RESET"
+      add '%s  %-8s %10s  %s%s' "$C_DIM" PID VRAM COMMAND "$C_RESET"
+    fi
+    local gkey gv
+    while read -r gkey gv pid; do
+      [[ -n $pid ]] || continue
+      if (( use_engine )); then
+        local gpct gpad
+        gpct=$(pct10 "$gkey" "$ELAPSED_NS")
+        printf -v gpad '%8s' "$gpct"
+        add '  %-8s %s %10s  %s' "$pid" "$(hcp "$gpad")" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_name "$pid")"
+      else
+        add '  %-8s %10s  %s' "$pid" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_name "$pid")"
+      fi
+    done < <(
+      for pid in "${CUR_GPU_PIDS[@]}"; do
+        if (( use_engine )); then
+          d=0
+          [[ -n ${PRE_GPU_ENG[$pid]+x} ]] && d=$(( CUR_GPU_ENG[$pid] - PRE_GPU_ENG[$pid] ))
+          (( d < 0 )) && d=0
+          echo "$d ${CUR_GPU_VRAM[$pid]:-0} $pid"
+        else
+          echo "${CUR_GPU_VRAM[$pid]:-0} 0 $pid"
+        fi
+      done | sort -k1,1rn -k2,2rn | head -5
+    )
+  fi
 }
 
 gpu_sysfs() {
@@ -575,6 +634,11 @@ while :; do
     PRE_CORES=("${CUR_CORES[@]}")
     PRE_DISK_R=$CUR_DISK_R; PRE_DISK_W=$CUR_DISK_W
     PRE_PROC_TICKS=(); for k in "${!CUR_PROC_TICKS[@]}"; do PRE_PROC_TICKS[$k]=${CUR_PROC_TICKS[$k]}; done
+    PRE_GPU_PIDS=("${CUR_GPU_PIDS[@]}")
+    PRE_GPU_VRAM=(); for k in "${!CUR_GPU_VRAM[@]}"; do PRE_GPU_VRAM[$k]=${CUR_GPU_VRAM[$k]}; done
+    PRE_GPU_GTT=(); for k in "${!CUR_GPU_GTT[@]}"; do PRE_GPU_GTT[$k]=${CUR_GPU_GTT[$k]}; done
+    PRE_GPU_ENG=(); for k in "${!CUR_GPU_ENG[@]}"; do PRE_GPU_ENG[$k]=${CUR_GPU_ENG[$k]}; done
+    PRE_GPU_EV=(); for k in "${!CUR_GPU_EV[@]}"; do PRE_GPU_EV[$k]=${CUR_GPU_EV[$k]}; done
   fi
   PRE_NS=$CUR_NS
 done
