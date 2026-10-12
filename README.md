@@ -116,6 +116,13 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `RSS` / `swap` | 物理内存 / 已换出的进程内存 |
 | `NET` | 该进程持有的套接字总数，以及其中 TCP 已建立、监听和 UDP 的数量 |
 
+> `COMMAND` / `PROC` / `THREADS` 里的名字来自 `/proc/<pid>/comm`，
+> 这是程序自己可以改的标签（最长 15 字符），并不一定是可执行文件名。
+> Wine/Proton 会把游戏进程命名为 `GameThread`，浏览器会给线程起
+> `Compositor`、`Renderer` 之类的名字。脚本在名字与可执行文件或命令行里的
+> `.exe` 不一致时会用方括号补上真实程序，例如
+> `GameThread [Cyberpunk2077.exe]`。
+
 ## 瓶颈判读
 
 - `VRAM` 接近 100% 且 `GTT`、`evicted` 持续上涨 → 显存溢出，材质在内存间搬移，

@@ -371,6 +371,25 @@ resolve_pid() {
 }
 
 proc_name() { local s; IFS= read -r s < /proc/"$1"/comm 2>/dev/null && echo "$s" || echo "?"; }
+proc_label() {  # comm plus a meaningful app/exe label when the comm was renamed
+  local pid=$1 c e label="" arg
+  c=$(proc_name "$pid")
+  e=$(readlink "/proc/$pid/exe" 2>/dev/null) || e=""
+  e=${e##*/}
+  if [[ -r /proc/$pid/cmdline ]]; then
+    while IFS= read -r -d '' arg; do
+      case ${arg,,} in
+        *.exe) label=${arg##*[\\/]}; break ;;
+      esac
+    done < /proc/"$pid"/cmdline
+  fi
+  [[ -n $label ]] || label=$e
+  if [[ -n $label && $label != "$c" ]]; then
+    printf '%s [%s]' "$c" "$label"
+  else
+    printf '%s' "$c"
+  fi
+}
 proc_rss_kb() { local sz r rest; read -r sz r rest < /proc/"$1"/statm 2>/dev/null && echo $(( r * PAGE_KB )) || echo 0; }
 proc_swap_kb() { awk '/^VmSwap:/{print $2; exit}' /proc/"$1"/status 2>/dev/null; }
 
@@ -567,7 +586,7 @@ render_system() {
     [[ -n $pid ]] || continue
     pv=$(tenths "$p10"); printf -v ppad '%8s' "$pv"
     add '  %-8s %s %10s  %s' "$pid" "$(hcp "$ppad")" \
-      "$(fmt_kib_b "$(proc_rss_kb "$pid")")" "$(proc_name "$pid")"
+      "$(fmt_kib_b "$(proc_rss_kb "$pid")")" "$(proc_label "$pid")"
   done < <(
     for pid in "${!CUR_PROC_TICKS[@]}"; do
       [[ -n ${PRE_PROC_TICKS[$pid]+x} ]] || continue
@@ -598,9 +617,9 @@ render_system() {
         local gpct gpad
         gpct=$(pct10 "$gkey" "$ELAPSED_NS")
         printf -v gpad '%8s' "$gpct"
-        add '  %-8s %s %10s  %s' "$pid" "$(hcp "$gpad")" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_name "$pid")"
+        add '  %-8s %s %10s  %s' "$pid" "$(hcp "$gpad")" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_label "$pid")"
       else
-        add '  %-8s %10s  %s' "$pid" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_name "$pid")"
+        add '  %-8s %10s  %s' "$pid" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_label "$pid")"
       fi
     done < <(
       for pid in "${CUR_GPU_PIDS[@]}"; do
@@ -654,7 +673,7 @@ render_proc() {
   cpu_pct=$(pct10 "$dt" "$e")
   (( BARS )) && barp="$(hbar "$(( dt * 100 / e ))" 12) "
   add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s' \
-    "$C_BOLD" "$(proc_name "$pid")" "$C_RESET" "$pid" \
+    "$C_BOLD" "$(proc_label "$pid")" "$C_RESET" "$pid" \
     "$(fmt_kib_b "$(proc_rss_kb "$pid")")" "$(fmt_kib_b "$(proc_swap_kb "$pid")")" "${#CUR_THREAD_TICKS[@]}"
   add 'CPU   %s%s%% (%s cores of %s)' "$barp" "$(hcp "$cpu_pct")" "$(cores2 "$dt" "$e")" "$ncores"
   add '%sTHREADS%s  (top 5 by CPU; 100%% = one core)' "$C_BOLD" "$C_RESET"
