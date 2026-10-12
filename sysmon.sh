@@ -733,12 +733,15 @@ render_system() {
     "$barg" "$hv" "$v1" "$v2" "$v3" "$gtt_pct" "$gtv" "$gb"
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     local -A engsum=()
-    local epid ename ens
+    local epid ename ens i
+    local -a pairs=()
     for epid in "${CUR_GPU_PIDS[@]}"; do
-      while read -r ename ens; do
-        [[ -n $ename && -n $ens ]] || continue
+      read -r -a pairs <<< "${ENG_DELTA[$epid]:-}"
+      for (( i = 0; i + 1 < ${#pairs[@]}; i += 2 )); do
+        ename=${pairs[i]}; ens=${pairs[i+1]}
+        [[ -n $ename && $ens =~ ^[0-9]+$ ]] || continue
         engsum[$ename]=$(( ${engsum[$ename]:-0} + ens ))
-      done <<< "${ENG_DELTA[$epid]:-}"
+      done
     done
     if (( ${#engsum[@]} > 0 )); then
       local eline=""
@@ -953,11 +956,19 @@ render_proc() {
     engine_delta_v "$PRE_PENGINES" "$CUR_PENGINES"
     v_pct10 "$ENGTOTAL" "$ELAPSED_NS"; eng_pct=$PCT10
     pvram_pct=$(( vt ? 100 * (CUR_PV * 1024) / vt : 0 ))
-    while read -r ename ens; do
-      [[ -n $ename && -n $ens ]] || continue
-      v_pct10 "$ens" "$ELAPSED_NS"; v_hcp "$PCT10"
-      eline+="$ename $HCP%   "
-    done < <(printf '%s\n' ${ENGDELTA:-} | sort -k2,2rn | head -4)
+    local -a epairs=() elines=()
+    read -r -a epairs <<< "${ENGDELTA:-}"
+    local ei
+    for (( ei = 0; ei + 1 < ${#epairs[@]}; ei += 2 )); do
+      [[ ${epairs[ei+1]} =~ ^[0-9]+$ ]] || continue
+      elines+=("${epairs[ei]} ${epairs[ei+1]}")
+    done
+    if (( ${#elines[@]} > 0 )); then
+      while read -r ename ens; do
+        v_pct10 "$ens" "$ELAPSED_NS"; v_hcp "$PCT10"
+        eline+="$ename $HCP%   "
+      done < <(printf '%s\n' "${elines[@]}" | sort -k2,2rn | head -4)
+    fi
     [[ -n $eline ]] || eline="idle   "
     v_hcp "$eng_pct"
     add 'GPU   engines %s total %s%%' "$eline" "$HCP"
