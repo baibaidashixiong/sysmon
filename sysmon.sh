@@ -180,6 +180,10 @@ declare -A PRE_PROC_TICKS CUR_PROC_TICKS
 declare -A PRE_GPU_VRAM CUR_GPU_VRAM PRE_GPU_GTT CUR_GPU_GTT
 declare -A PRE_GPU_ENG CUR_GPU_ENG PRE_GPU_EV CUR_GPU_EV
 declare -A PRE_GPU_ENGINES CUR_GPU_ENGINES
+declare -A ENG_DELTA ENG_TOTAL
+declare -A LABEL_CACHE
+declare -a GPU_PATHS=()
+GPU_PATH_AGE=999
 declare -A PRE_NET_RX CUR_NET_RX PRE_NET_TX CUR_NET_TX
 declare -A PRE_THREAD_TICKS CUR_THREAD_TICKS PRE_THREAD_COMM CUR_THREAD_COMM
 for v in CPU_TOTAL CPU_IDLE CPU_IOWAIT DISK_R DISK_W PTICKS PREAD PWRITE ENGINE PV RAM PGT PEV; do
@@ -216,31 +220,75 @@ snapshot_system() {  # $1=tag
   cpu_part "$tag"
   disk_part "$tag"
   snapshot_net "$tag"
-  local -n procs="${tag}_PROC_TICKS"
-  procs=()
-  for p in /proc/[0-9]*; do
-    IFS= read -r stat 2>/dev/null < "$p/stat" || continue
-    rest=${stat#*) }
-    read -r -a f <<< "$rest"
-    procs[${p##*/}]=$(( ${f[11]:-0} + ${f[12]:-0} ))
-  done
+  procs_snapshot "$tag"
+  gpu_scan_all "$tag"
+}
+
+procs_snapshot() {  # $1=tag; one pass over every /proc/<pid>/stat
+  local -n ticks="${1}_PROC_TICKS"
+  ticks=()
+  local pid t
+  while read -r pid t; do
+    [[ -n $pid ]] && ticks[$pid]=$t
+  done < <(grep -H '^' /proc/[0-9]*/stat 2>/dev/null | awk '
+    {
+      i=index($0,":"); path=substr($0,1,i-1); rest=substr($0,i+1)
+      j=0
+      for (k=length(rest); k>0; k--) if (substr(rest,k,1)==")") { j=k; break }
+      if (!j) next
+      split(substr(rest,j+2), fs, /[ \t]+/)
+      split(path, pa, "/")
+      printf "%s %d\n", pa[3], fs[12]+fs[13]
+    }')
+}
+
+gpu_scan_all() {  # $1=tag; one grep+awk pass over every DRM client on the box
+  local tag=$1
   local -n gpids="${tag}_GPU_PIDS" gvram="${tag}_GPU_VRAM" ggtt="${tag}_GPU_GTT"
-  local -n geng="${tag}_GPU_ENG" gev="${tag}_GPU_EV"
-  local -n gengines="${tag}_GPU_ENGINES"
+  local -n geng="${tag}_GPU_ENG" gev="${tag}_GPU_EV" gengines="${tag}_GPU_ENGINES"
   gpids=(); gvram=(); ggtt=(); geng=(); gev=(); gengines=()
   (( GPU_TOP )) || return 0
-  local fd gp seen=" " v g e ev
-  while IFS= read -r fd; do
-    gp=${fd#/proc/}; gp=${gp%%/*}
-    [[ $seen == *" $gp "* ]] && continue
-    seen+="$gp "
-    [[ -r /proc/$gp/fdinfo ]] || continue
-    local engs
-    read -r v g e ev engs < <(proc_gpu "$gp")
-    gpids+=("$gp")
-    gvram[$gp]=$v; ggtt[$gp]=$g; geng[$gp]=$e; gev[$gp]=$ev
-    gengines[$gp]=$engs
-  done < <(grep -l -m1 '^drm-client-id:' /proc/[0-9]*/fdinfo/* 2>/dev/null)
+  # full directory walk only every few frames; otherwise reuse the client list
+  if (( GPU_PATH_AGE >= 5 )) || (( ${#GPU_PATHS[@]} == 0 )); then
+    mapfile -t GPU_PATHS < <(grep -l -m1 '^drm-client-id:' /proc/[0-9]*/fdinfo/* 2>/dev/null)
+    GPU_PATH_AGE=0
+  else
+    GPU_PATH_AGE=$(( GPU_PATH_AGE + 1 ))
+  fi
+  (( ${#GPU_PATHS[@]} > 0 )) || return 0
+  local pid v g e ev engs
+  while IFS='|' read -r pid v g e ev engs; do
+    [[ -n $pid ]] || continue
+    gpids+=("$pid")
+    gvram[$pid]=$v; ggtt[$pid]=$g; geng[$pid]=$e; gev[$pid]=$ev; gengines[$pid]=$engs
+  done < <(
+    grep -H -E '^(drm-client-id|drm-pdev|drm-memory-vram|drm-memory-gtt|drm-engine-|amd-evicted-vram)' \
+      "${GPU_PATHS[@]}" 2>/dev/null | awk '
+      {
+        i=index($0,":"); path=substr($0,1,i-1); line=substr($0,i+1)
+        if (path != cur) { cur=path; cid=""; pdev=""; split(path,pa,"/"); pid=pa[3] }
+        split(line,f,/[ \t]+/); key=f[1]
+        pids[pid]=1
+        if (key=="drm-client-id:") cid=f[2]
+        else if (key=="drm-pdev:") { pdev=f[2]; gsub(/[:.]/,"_",pdev) }
+        else if (key=="drm-memory-vram:") { k=pid SUBSEP pdev SUBSEP cid; if(!(k in vr)) vr[k]=f[2]+0 }
+        else if (key=="drm-memory-gtt:")  { k=pid SUBSEP pdev SUBSEP cid; if(!(k in gt)) gt[k]=f[2]+0 }
+        else if (key=="amd-evicted-vram:"){ k=pid SUBSEP pdev SUBSEP cid; if(!(k in ev)) ev[k]=f[2]+0 }
+        else if (key ~ /^drm-engine-/) {
+          name=key; sub(/^drm-engine-/,"",name); sub(/:$/,"",name)
+          k=pid SUBSEP pdev SUBSEP cid SUBSEP name
+          if(!(k in en)) en[k]=f[2]+0
+        }
+      }
+      END{
+        for(k in vr){split(k,a,SUBSEP); pv[a[1]]+=vr[k]}
+        for(k in gt){split(k,a,SUBSEP); pg[a[1]]+=gt[k]}
+        for(k in ev){split(k,a,SUBSEP); pe[a[1]]+=ev[k]}
+        for(k in en){split(k,a,SUBSEP); pt[a[1]]+=en[k]; es[a[1]]=es[a[1]] a[2]"/"a[3]"/"a[4]"="en[k]" "}
+        for(q in pids) printf "%s|%d|%d|%d|%d|%s\n", q, pv[q]+0, pg[q]+0, pt[q]+0, pe[q]+0, es[q]
+      }
+    '
+  )
 }
 
 snapshot_net() {  # $1=tag; collects per-interface rx/tx byte counters
@@ -318,6 +366,23 @@ engine_total_delta() {  # $1=prev $2=cur -> total ns over matching client/engine
   printf '%d' "$total"
 }
 
+engine_delta_v() {  # $1=prev $2=cur -> ENGDELTA "name ns ..." and ENGTOTAL ns
+  local -A P=() C=() D=()
+  local kv key name d
+  for kv in $1; do P[${kv%%=*}]=${kv#*=}; done
+  for kv in $2; do C[${kv%%=*}]=${kv#*=}; done
+  ENGTOTAL=0; ENGDELTA=""
+  for key in "${!C[@]}"; do
+    [[ -n ${P[$key]+x} ]] || continue
+    d=$(( C[$key] - P[$key] ))
+    (( d > 0 )) || continue
+    name=${key##*/}
+    D[$name]=$(( ${D[$name]:-0} + d ))
+    ENGTOTAL=$(( ENGTOTAL + d ))
+  done
+  for name in "${!D[@]}"; do ENGDELTA+="$name ${D[$name]} "; done
+}
+
 snapshot_proc() {  # $1=tag $2=pid
   local tag=$1 pid=$2 stat rest t tid f c
   cpu_part "$tag"
@@ -390,10 +455,15 @@ resolve_pid() {
   echo "$best"
 }
 
-proc_name() { local s; IFS= read -r s < /proc/"$1"/comm 2>/dev/null && echo "$s" || echo "?"; }
-proc_label() {  # comm plus a meaningful app/exe label when the comm was renamed
+proc_name() { local s; IFS= read -r s 2>/dev/null < /proc/"$1"/comm && echo "$s" || echo "?"; }
+proc_label_v() {  # sets LABEL: comm plus a meaningful app/exe label when renamed
   local pid=$1 c e label="" arg
   c=$(proc_name "$pid")
+  local cached=${LABEL_CACHE[$pid]:-}
+  if [[ -n $cached && ${cached%%$'\t'*} == "$c" ]]; then
+    LABEL=${cached#*$'\t'}
+    return
+  fi
   e=$(readlink "/proc/$pid/exe" 2>/dev/null) || e=""
   e=${e##*/}
   if [[ -r /proc/$pid/cmdline ]]; then
@@ -405,18 +475,24 @@ proc_label() {  # comm plus a meaningful app/exe label when the comm was renamed
   fi
   [[ -n $label ]] || label=$e
   if [[ -n $label && $label != "$c" ]]; then
-    printf '%s [%s]' "$c" "$label"
+    LABEL="$c [$label]"
   else
-    printf '%s' "$c"
+    LABEL=$c
   fi
+  LABEL_CACHE[$pid]="$c"$'\t'"$LABEL"
 }
+proc_label() { proc_label_v "$1"; printf '%s' "$LABEL"; }
 proc_rss_kb() { local sz r rest; read -r sz r rest < /proc/"$1"/statm 2>/dev/null && echo $(( r * PAGE_KB )) || echo 0; }
+rss_kb_v() { local sz r rest; RSS_KB=0; read -r sz r rest < /proc/"$1"/statm 2>/dev/null && RSS_KB=$(( r * PAGE_KB )); }
 proc_swap_kb() { awk '/^VmSwap:/{print $2; exit}' /proc/"$1"/status 2>/dev/null; }
 
 # ---------- rendering ----------
 tty_ok=0; [[ -t 1 ]] && tty_ok=1
 TERM_COLS=80; TERM_LINES=24; ROWS_CPU=5; ROWS_GPU=5
+LAYOUT_AGE=999
 update_layout() {
+  (( LAYOUT_AGE < 5 )) && { LAYOUT_AGE=$(( LAYOUT_AGE + 1 )); return; }
+  LAYOUT_AGE=0
   if (( tty_ok )); then
     TERM_COLS=$(tput cols 2>/dev/null || echo 80)
     TERM_LINES=$(tput lines 2>/dev/null || echo 24)
@@ -476,6 +552,78 @@ temp_c() {  # $1 = integer degrees (may be empty) -> colored "<n>C"
   elif (( t >= 55 )); then printf '%s%sC%s' "$C_YELLOW" "$t" "$C_RESET"
   else printf '%s%sC%s' "$C_GREEN" "$t" "$C_RESET"; fi
 }
+
+# no-fork variants: write to globals instead of spawning a subshell per value
+SEV=""; HCP=""; BAR=""; PCT10="0.0"; TENTHS="0.0"; CORES2="0.00"
+FMTB="0.0B"; RATE=0; TEMPC="--"; PSI="n/a"; TEMP=""
+v_sev() {
+  local n=${1%%.*}; n=${n:-0}; (( n < 0 )) && n=0
+  if (( n >= 90 )); then SEV=$C_HOT
+  elif (( n >= 75 )); then SEV=$C_RED
+  elif (( n >= 50 )); then SEV=$C_YELLOW
+  else SEV=$C_GREEN; fi
+}
+v_hcp() { v_sev "$1"; HCP="$SEV$1$C_RESET"; }
+v_bar() {
+  local p=${1%%.*} w=${2:-12} f i b=""
+  (( p < 0 )) && p=0; (( p > 100 )) && p=100
+  f=$(( p * w / 100 ))
+  for (( i = 0; i < w; i++ )); do (( i < f )) && b+='#' || b+='.'; done
+  v_sev "$p"; BAR="$SEV$b$C_RESET"
+}
+v_pct10() {
+  local d=${1:-0} e=${2:-0} v
+  if (( e <= 0 )); then PCT10="0.0"; return; fi
+  (( d < 0 )) && d=0
+  v=$(( d * 1000 / e )); PCT10="$(( v / 10 )).$(( v % 10 ))"
+}
+v_tenths() { local v=${1:-0}; (( v < 0 )) && v=0; TENTHS="$(( v / 10 )).$(( v % 10 ))"; }
+v_cores2() {
+  local d=${1:-0} e=${2:-0} v
+  if (( e <= 0 )); then CORES2="0.00"; return; fi
+  (( d < 0 )) && d=0
+  v=$(( d * 100 / e )); CORES2="$(( v / 100 )).$(printf '%02d' $(( v % 100 )))"
+}
+v_fmt_b() {
+  local b=${1:-0} s="" u=1 suf=B t
+  (( b < 0 )) && { s="-"; b=$(( -b )); }
+  if (( b >= 1073741824 )); then u=1073741824; suf=G
+  elif (( b >= 1048576 )); then u=1048576; suf=M
+  elif (( b >= 1024 )); then u=1024; suf=K
+  fi
+  t=$(( (b * 10 + u / 2) / u ))
+  FMTB="$s$(( t / 10 )).$(( t % 10 ))$suf"
+}
+v_fmt_kib() { v_fmt_b $(( ${1:-0} * 1024 )); }
+v_rate() {
+  local d=${1:-0} ns=${2:-0} m=${3:-1} ms t
+  if (( ns <= 0 )); then RATE=0; return; fi
+  ms=$(( ns / 1000000 )); (( ms > 0 )) || ms=1
+  t=$(( d * m * 1000 / ms )); (( t < 0 )) && t=0
+  RATE=$t
+}
+v_temp() {
+  local t=${1:-}
+  if [[ -z $t ]]; then TEMPC="--"; return; fi
+  if (( t >= 80 )); then SEV=$C_HOT
+  elif (( t >= 65 )); then SEV=$C_RED
+  elif (( t >= 55 )); then SEV=$C_YELLOW
+  else SEV=$C_GREEN; fi
+  TEMPC="$SEV${t}C$C_RESET"
+}
+read_temp_v() {
+  local t; TEMP=""
+  [[ -n ${1:-} && -r $1/temp1_input ]] || return 0
+  read -r t 2>/dev/null < "$1/temp1_input"; TEMP=$(( ${t:-0} / 1000 ))
+}
+v_psi() {
+  local f=$1 want=$2 line x
+  PSI="n/a"
+  while IFS= read -r line; do
+    [[ $line == "$want "* ]] || continue
+    for x in $line; do [[ $x == avg10=* ]] && { PSI=${x#avg10=}; return; }; done
+  done < "/proc/pressure/$f" 2>/dev/null
+}
 hbar() {  # $1 percent, $2 width
   local p=${1%%.*} w=${2:-12} f i b=""
   (( p < 0 )) && p=0; (( p > 100 )) && p=100
@@ -486,8 +634,10 @@ hbar() {  # $1 percent, $2 width
 FRAME=""
 add() { local ln; printf -v ln "$@"; FRAME+="$ln"$'\n'; }
 
-clip_line() {  # $1 = line with ANSI codes, $2 = max visible chars
+clip_line_v() {  # sets CLIPPED: $1 = line with ANSI codes, $2 = max visible chars
   local s=$1 max=$2 out="" i=0 n=0 len=${#1} c seq
+  local plain=${s//$'\033'\[*([0-9;?])[a-zA-Z]/}
+  if (( ${#plain} <= max )); then CLIPPED=$s; return; fi
   while (( i < len )); do
     c=${s:i:1}
     if [[ $c == $'\033' ]]; then
@@ -502,13 +652,15 @@ clip_line() {  # $1 = line with ANSI codes, $2 = max visible chars
       out+=$c; (( n++ )); (( i++ ))
     fi
   done
-  printf '%s%s' "$out" "$C_RESET"
+  CLIPPED="$out$C_RESET"
 }
+clip_line() { clip_line_v "$1" "$2"; printf '%s' "$CLIPPED"; }
 
 emit_frame() {  # single write, line-by-line truncation, no stale fragments
   local out="" line
   while IFS= read -r line; do
-    out+="$(clip_line "$line" $(( TERM_COLS - 1 )))"$'\033[K\n'
+    clip_line_v "$line" $(( TERM_COLS - 1 ))
+    out+="$CLIPPED"$'\033[K\n'
   done <<< "$FRAME"
   printf '\033[?2026h\033[H%s\033[J\033[?2026l' "$out"
 }
@@ -529,17 +681,23 @@ render_system() {
   local dt=$(( CUR_CPU_TOTAL - PRE_CPU_TOTAL )) di=$(( CUR_CPU_IDLE - PRE_CPU_IDLE )) diw=$(( CUR_CPU_IOWAIT - PRE_CPU_IOWAIT ))
   local e=$(( ELAPSED_NS * CLK_TCK / 1000000000 )); (( e > 0 )) || e=1
   local busy=$(( dt - di - diw )) ncores=${#CUR_CORES[@]}
-  local busy_pct idle_pct iow_pct barc=""
-  busy_pct=$(pct10 "$busy" "$dt"); idle_pct=$(pct10 "$di" "$dt"); iow_pct=$(pct10 "$diw" "$dt")
-  (( BARS )) && barc="$(hbar "$busy_pct" 12) "
+  local busy_pct idle_pct iow_pct barc="" hbusy cores2v p1 p2
+  v_pct10 "$busy" "$dt"; busy_pct=$PCT10
+  v_pct10 "$di" "$dt"; idle_pct=$PCT10
+  v_pct10 "$diw" "$dt"; iow_pct=$PCT10
+  if (( BARS )); then v_bar "$busy_pct" 12; barc="$BAR "; fi
+  v_hcp "$busy_pct"; hbusy=$HCP
+  v_cores2 "$busy" "$e"; cores2v=$CORES2
+  v_psi cpu some; p1=$PSI
+  v_psi cpu full; p2=$PSI
   add 'CPU   %s%s%% (%s/%s)   idle %s%%  iowait %s%%   PSI %s%%/%s%%' \
-    "$barc" "$(hcp "$busy_pct")" "$(cores2 "$busy" "$e")" "$ncores" "$idle_pct" "$iow_pct" \
-    "$(psi10 cpu some)" "$(psi10 cpu full)"
+    "$barc" "$hbusy" "$cores2v" "$ncores" "$idle_pct" "$iow_pct" "$p1" "$p2"
   local percore=""
   for i in "${!CUR_CORES[@]}"; do
     read -r t idle _ <<< "${CUR_CORES[$i]}"
     read -r pt piddle _ <<< "${PRE_CORES[$i]}"
-    percore+="$(hcp "$(pct10 $(( (t-pt) - (idle-piddle) )) "$e")") "
+    v_pct10 $(( (t-pt) - (idle-piddle) )) "$e"; v_hcp "$PCT10"
+    percore+="$HCP "
   done
   add '      cores %s' "$percore"
   read_mem
@@ -548,43 +706,61 @@ render_system() {
   local swap_used swap_pct
   swap_used=$(( stotal - sfree ))
   swap_pct=$(( stotal ? 100 * swap_used / stotal : 0 ))
-  local barm=""; (( BARS )) && barm="$(hbar "$mem_pct" 12) "
+  local barm="" hm f1 f2 f3 f4 f5
+  if (( BARS )); then v_bar "$mem_pct" 12; barm="$BAR "; fi
+  v_hcp "$mem_pct"; hm=$HCP
+  v_fmt_kib $(( used - avail )); f1=$FMTB
+  v_fmt_kib "$used"; f2=$FMTB
+  v_fmt_kib "$avail"; f3=$FMTB
+  v_fmt_kib "$swap_used"; f4=$FMTB
+  v_fmt_kib "$stotal"; f5=$FMTB
   add 'MEM   %s%s%%   %s / %s used   avail %s   swap %s / %s (%s%%)' \
-    "$barm" "$(hcp "$mem_pct")" "$(fmt_kib_b $(( used - avail )))" "$(fmt_kib_b "$used")" \
-    "$(fmt_kib_b "$avail")" "$(fmt_kib_b "$swap_used")" "$(fmt_kib_b "$stotal")" "$swap_pct"
+    "$barm" "$hm" "$f1" "$f2" "$f3" "$f4" "$f5" "$swap_pct"
   local vu vt gu gt
-  read -r vu vt gu gt < <(gpu_sysfs)
+  gpu_sysfs_v; vu=$GPU_VU; vt=$GPU_VT; gu=$GPU_GU; gt=$GPU_GT
   local vram_pct=$(( vt ? 100 * vu / vt : 0 )) gtt_pct=$(( gt ? 100 * gu / gt : 0 ))
-  local barg=""; (( BARS )) && barg="$(hbar "$vram_pct" 12) "
+  local barg="" hv v1 v2 v3 gtv
+  if (( BARS )); then v_bar "$vram_pct" 12; barg="$BAR "; fi
+  v_hcp "$vram_pct"; hv=$HCP
+  v_fmt_b "$vu"; v1=$FMTB
+  v_fmt_b "$vt"; v2=$FMTB
+  v_fmt_b "$gu"; v3=$FMTB
+  read_temp_v "$HWM_GPU"; v_temp "$TEMP"; gtv=$TEMPC
   local gb="" gbusy
-  gbusy=$(gpu_busy); [[ -n $gbusy ]] && gb="   busy $(hcp "$gbusy")%"
+  gpu_busy_v; gbusy=$GBUSY
+  if [[ -n $gbusy ]]; then v_hcp "$gbusy"; gb="   busy $HCP%"; fi
   add 'GPU   %sVRAM %s%%   %s / %s   GTT %s (%s%%)   temp %s%s' \
-    "$barg" "$(hcp "$vram_pct")" "$(fmt_b "$vu")" "$(fmt_b "$vt")" "$(fmt_b "$gu")" "$gtt_pct" \
-    "$(temp_c "$(read_temp "$HWM_GPU")")" "$gb"
+    "$barg" "$hv" "$v1" "$v2" "$v3" "$gtt_pct" "$gtv" "$gb"
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     local -A engsum=()
     local epid ename ens
     for epid in "${CUR_GPU_PIDS[@]}"; do
       while read -r ename ens; do
+        [[ -n $ename && -n $ens ]] || continue
         engsum[$ename]=$(( ${engsum[$ename]:-0} + ens ))
-      done < <(engine_deltas "${PRE_GPU_ENGINES[$epid]:-}" "${CUR_GPU_ENGINES[$epid]:-}")
+      done <<< "${ENG_DELTA[$epid]:-}"
     done
     if (( ${#engsum[@]} > 0 )); then
       local eline=""
       while read -r ename ens; do
-        eline+="$ename $(hcp "$(pct10 "$ens" "$ELAPSED_NS")")%   "
+        v_pct10 "$ens" "$ELAPSED_NS"
+        eline+="$ename $(v_hcp "$PCT10"; printf '%s' "$HCP")%   "
       done < <(for ename in "${!engsum[@]}"; do echo "$ename ${engsum[$ename]}"; done | sort -k2,2rn | head -4)
       add 'ENGINE  %s' "$eline"
     fi
   fi
-  add 'DISK  %s   read %s/s   write %s/s' "$ROOT_DISK" \
-    "$(fmt_b "$(rate_b $(( CUR_DISK_R - PRE_DISK_R )) "$ELAPSED_NS" 512)")" \
-    "$(fmt_b "$(rate_b $(( CUR_DISK_W - PRE_DISK_W )) "$ELAPSED_NS" 512)")"
+  local d1 d2
+  v_rate $(( CUR_DISK_R - PRE_DISK_R )) "$ELAPSED_NS" 512; v_fmt_b "$RATE"; d1=$FMTB
+  v_rate $(( CUR_DISK_W - PRE_DISK_W )) "$ELAPSED_NS" 512; v_fmt_b "$RATE"; d2=$FMTB
+  add 'DISK  %s   read %s/s   write %s/s' "$ROOT_DISK" "$d1" "$d2"
   local netline="" iface rxd txd
   while read -r iface rxd txd; do
     [[ -n $iface ]] || continue
     if (( rxd > 0 || txd > 0 )) || { [[ -z $netline && $iface == "$DEFAULT_IFACE" ]]; }; then
-      netline+="$iface rx $(fmt_b "$(rate_b "$rxd" "$ELAPSED_NS")")/s  tx $(fmt_b "$(rate_b "$txd" "$ELAPSED_NS")")/s   "
+      local rxs txs
+      v_rate "$rxd" "$ELAPSED_NS"; v_fmt_b "$RATE"; rxs=$FMTB
+      v_rate "$txd" "$ELAPSED_NS"; v_fmt_b "$RATE"; txs=$FMTB
+      netline+="$iface rx $rxs/s  tx $txs/s   "
     fi
   done < <(
     for iface in "${!CUR_NET_RX[@]}"; do
@@ -597,16 +773,22 @@ render_system() {
   )
   [[ -n $netline ]] || netline="idle"
   add 'NET   %s' "$netline"
-  add 'TEMP  CPU %s   GPU %s   NVMe %s' "$(temp_c "$(read_temp "$HWM_CPU")")" "$(temp_c "$(read_temp "$HWM_GPU")")" "$(temp_c "$(read_temp "$HWM_NVME")")"
+  local tc tg tn
+  read_temp_v "$HWM_CPU"; v_temp "$TEMP"; tc=$TEMPC
+  read_temp_v "$HWM_GPU"; v_temp "$TEMP"; tg=$TEMPC
+  read_temp_v "$HWM_NVME"; v_temp "$TEMP"; tn=$TEMPC
+  add 'TEMP  CPU %s   GPU %s   NVMe %s' "$tc" "$tg" "$tn"
   add ''
   add '%sTOP CPU%s  (last %ss)' "$C_BOLD" "$C_RESET" "$INTERVAL"
   add '%s  %-8s %8s %10s  %s%s' "$C_DIM" PID CPU% RSS COMMAND "$C_RESET"
   local pid p10 pv ppad
   while read -r p10 pid; do
     [[ -n $pid ]] || continue
-    pv=$(tenths "$p10"); printf -v ppad '%8s' "$pv"
-    add '  %-8s %s %10s  %s' "$pid" "$(hcp "$ppad")" \
-      "$(fmt_kib_b "$(proc_rss_kb "$pid")")" "$(proc_label "$pid")"
+    v_tenths "$p10"; printf -v ppad '%8s' "$TENTHS"
+    v_hcp "$ppad"
+    rss_kb_v "$pid"; v_fmt_kib "$RSS_KB"
+    proc_label_v "$pid"
+    add '  %-8s %s %10s  %s' "$pid" "$HCP" "$FMTB" "$LABEL"
   done < <(
     for pid in "${!CUR_PROC_TICKS[@]}"; do
       [[ -n ${PRE_PROC_TICKS[$pid]+x} ]] || continue
@@ -618,8 +800,7 @@ render_system() {
     add ''
     local engine_total=0
     for pid in "${CUR_GPU_PIDS[@]}"; do
-      [[ -n ${PRE_GPU_ENG[$pid]+x} ]] || continue
-      d=$(engine_total_delta "${PRE_GPU_ENGINES[$pid]:-}" "${CUR_GPU_ENGINES[$pid]:-}")
+      d=${ENG_TOTAL[$pid]:-0}
       (( d > 0 )) && engine_total=$(( engine_total + d ))
     done
     local use_engine=0; (( engine_total > 0 )) && use_engine=1
@@ -638,7 +819,7 @@ render_system() {
     done < <(
       for pid in "${CUR_GPU_PIDS[@]}"; do
         if (( use_engine )); then
-          d=$(engine_total_delta "${PRE_GPU_ENGINES[$pid]:-}" "${CUR_GPU_ENGINES[$pid]:-}")
+          d=${ENG_TOTAL[$pid]:-0}
           echo "$d ${CUR_GPU_VRAM[$pid]:-0} $pid"
         else
           echo "${CUR_GPU_VRAM[$pid]:-0} 0 $pid"
@@ -662,11 +843,15 @@ render_system() {
       set -- $row; gkey=$1; gv=$2; pid=$3
       if (( use_engine )); then
         local gpct gpad
-        gpct=$(pct10 "$gkey" "$ELAPSED_NS")
-        printf -v gpad '%8s' "$gpct"
-        add '  %-8s %s %10s  %s' "$pid" "$(hcp "$gpad")" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_label "$pid")"
+        v_pct10 "$gkey" "$ELAPSED_NS"; gpct=$PCT10
+        printf -v gpad '%8s' "$gpct"; v_hcp "$gpad"
+        v_fmt_kib "${CUR_GPU_VRAM[$pid]:-0}"
+        proc_label_v "$pid"
+        add '  %-8s %s %10s  %s' "$pid" "$HCP" "$FMTB" "$LABEL"
       else
-        add '  %-8s %10s  %s' "$pid" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_label "$pid")"
+        v_fmt_kib "${CUR_GPU_VRAM[$pid]:-0}"
+        proc_label_v "$pid"
+        add '  %-8s %10s  %s' "$pid" "$FMTB" "$LABEL"
       fi
     done
   fi
@@ -701,24 +886,58 @@ gpu_busy() {  # integer GPU utilisation, or nothing when unsupported
   fi
 }
 
+gpu_sysfs_v() {  # sets GPU_VU/GPU_VT/GPU_GU/GPU_GT (bytes), no subshell
+  GPU_VU=0; GPU_VT=0; GPU_GU=0; GPU_GT=0
+  local line mu mt
+  if [[ -n $GPU_DEV ]]; then
+    read -r GPU_VU 2>/dev/null < "$GPU_DEV/mem_info_vram_used"
+    read -r GPU_VT 2>/dev/null < "$GPU_DEV/mem_info_vram_total"
+    read -r GPU_GU 2>/dev/null < "$GPU_DEV/mem_info_gtt_used"
+    read -r GPU_GT 2>/dev/null < "$GPU_DEV/mem_info_gtt_total"
+  elif (( NVIDIA )); then
+    line=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [[ -n $line ]]; then
+      IFS=', ' read -r mu mt <<< "$line"
+      GPU_VU=$(( mu * 1048576 )); GPU_VT=$(( mt * 1048576 ))
+    fi
+  fi
+}
+
+gpu_busy_v() {  # sets GBUSY (integer) or empty
+  GBUSY=""
+  if [[ -n $GPU_DEV && -r $GPU_DEV/gpu_busy_percent ]]; then
+    read -r GBUSY 2>/dev/null < "$GPU_DEV/gpu_busy_percent" || GBUSY=""
+    [[ $GBUSY =~ ^[0-9]+$ ]] && return
+    GBUSY=""
+  fi
+  if (( NVIDIA )); then
+    GBUSY=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [[ $GBUSY =~ ^[0-9]+$ ]] || GBUSY=""
+  fi
+}
+
 render_proc() {
   local pid=$1 e dt
   e=$(( ELAPSED_NS * CLK_TCK / 1000000000 )); (( e > 0 )) || e=1
   dt=$(( CUR_PTICKS - PRE_PTICKS ))
   local ncores=${#CUR_CORES[@]} cpu_pct barp=""
-  cpu_pct=$(pct10 "$dt" "$e")
-  (( BARS )) && barp="$(hbar "$(( dt * 100 / e ))" 12) "
+  v_pct10 "$dt" "$e"; cpu_pct=$PCT10
+  if (( BARS )); then v_bar $(( dt * 100 / e )) 12; barp="$BAR "; fi
+  proc_label_v "$pid"; local plabel=$LABEL
+  rss_kb_v "$pid"; local rssv; v_fmt_kib "$RSS_KB"; rssv=$FMTB
+  local swap_kb; swap_kb=$(proc_swap_kb "$pid"); v_fmt_kib "${swap_kb:-0}"; local swapv=$FMTB
+  v_hcp "$cpu_pct"; local hcpu=$HCP
+  v_cores2 "$dt" "$e"; local cores2v=$CORES2
   add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s' \
-    "$C_BOLD" "$(proc_label "$pid")" "$C_RESET" "$pid" \
-    "$(fmt_kib_b "$(proc_rss_kb "$pid")")" "$(fmt_kib_b "$(proc_swap_kb "$pid")")" "${#CUR_THREAD_TICKS[@]}"
-  add 'CPU   %s%s%% (%s cores of %s)' "$barp" "$(hcp "$cpu_pct")" "$(cores2 "$dt" "$e")" "$ncores"
+    "$C_BOLD" "$plabel" "$C_RESET" "$pid" "$rssv" "$swapv" "${#CUR_THREAD_TICKS[@]}"
+  add 'CPU   %s%s%% (%s cores of %s)' "$barp" "$hcpu" "$cores2v" "$ncores"
   add '%sTHREADS%s  (top 5 by CPU; 100%% = one core)' "$C_BOLD" "$C_RESET"
   local tid p10 pv ppad trows=0
   while read -r p10 tid; do
     [[ -n $tid ]] || continue
     trows=$(( trows + 1 ))
-    pv=$(tenths "$p10"); printf -v ppad '%7s' "$pv"
-    add '  %s%%  %-8s %s' "$(hcp "$ppad")" "$tid" "${CUR_THREAD_COMM[$tid]:-?}"
+    v_tenths "$p10"; printf -v ppad '%7s' "$TENTHS"; v_hcp "$ppad"
+    add '  %s%%  %-8s %s' "$HCP" "$tid" "${CUR_THREAD_COMM[$tid]:-?}"
   done < <(
     for tid in "${!CUR_THREAD_TICKS[@]}"; do
       [[ -n ${PRE_THREAD_TICKS[$tid]+x} ]] || continue
@@ -728,36 +947,50 @@ render_proc() {
   )
   (( trows > 0 )) || add '  %s(no thread activity in this interval)%s' "$C_DIM" "$C_RESET"
   local vu vt gu gt
-  read -r vu vt gu gt < <(gpu_sysfs)
+  gpu_sysfs_v; vu=$GPU_VU; vt=$GPU_VT; gu=$GPU_GU; gt=$GPU_GT
   if (( CUR_PV > 0 )); then
     local eng_pct pvram_pct eline="" ename ens
-    eng_pct=$(pct10 "$(engine_total_delta "$PRE_PENGINES" "$CUR_PENGINES")" "$ELAPSED_NS")
+    engine_delta_v "$PRE_PENGINES" "$CUR_PENGINES"
+    v_pct10 "$ENGTOTAL" "$ELAPSED_NS"; eng_pct=$PCT10
     pvram_pct=$(( vt ? 100 * (CUR_PV * 1024) / vt : 0 ))
     while read -r ename ens; do
-      eline+="$ename $(hcp "$(pct10 "$ens" "$ELAPSED_NS")")%   "
-    done < <(engine_deltas "$PRE_PENGINES" "$CUR_PENGINES" | sort -k2,2rn | head -4)
+      [[ -n $ename && -n $ens ]] || continue
+      v_pct10 "$ens" "$ELAPSED_NS"; v_hcp "$PCT10"
+      eline+="$ename $HCP%   "
+    done < <(printf '%s\n' ${ENGDELTA:-} | sort -k2,2rn | head -4)
     [[ -n $eline ]] || eline="idle   "
-    add 'GPU   engines %s total %s%%' "$eline" "$(hcp "$eng_pct")"
+    v_hcp "$eng_pct"
+    add 'GPU   engines %s total %s%%' "$eline" "$HCP"
+    v_fmt_kib "$CUR_PV"; local pvv=$FMTB; v_fmt_b "$vt"; local vtv=$FMTB
+    v_hcp "$pvram_pct"; local hpv=$HCP
+    v_fmt_kib "$CUR_PGT"; local pgv=$FMTB; v_fmt_kib "$CUR_PEV"; local pev=$FMTB
     add 'GPU   VRAM %s/%s (%s%%)   GTT %s   evicted %s' \
-      "$(fmt_kib_b "$CUR_PV")" "$(fmt_b "$vt")" "$(hcp "$pvram_pct")" \
-      "$(fmt_kib_b "$CUR_PGT")" "$(fmt_kib_b "$CUR_PEV")"
+      "$pvv" "$vtv" "$hpv" "$pgv" "$pev"
   else
-    add 'GPU   no DRM client found   system VRAM %s / %s   GTT %s' "$(fmt_b "$vu")" "$(fmt_b "$vt")" "$(fmt_b "$gu")"
+    local v1 v2 v3
+    v_fmt_b "$vu"; v1=$FMTB; v_fmt_b "$vt"; v2=$FMTB; v_fmt_b "$gu"; v3=$FMTB
+    add 'GPU   no DRM client found   system VRAM %s / %s   GTT %s' "$v1" "$v2" "$v3"
   fi
-  add 'DISK  read %s/s   write %s/s' \
-    "$(fmt_b "$(rate_b $(( CUR_PREAD - PRE_PREAD )) "$ELAPSED_NS")")" \
-    "$(fmt_b "$(rate_b $(( CUR_PWRITE - PRE_PWRITE )) "$ELAPSED_NS")")"
+  local rd wr
+  v_rate $(( CUR_PREAD - PRE_PREAD )) "$ELAPSED_NS"; v_fmt_b "$RATE"; rd=$FMTB
+  v_rate $(( CUR_PWRITE - PRE_PWRITE )) "$ELAPSED_NS"; v_fmt_b "$RATE"; wr=$FMTB
+  add 'DISK  read %s/s   write %s/s' "$rd" "$wr"
   local stotal sest slis sudp
   read -r stotal sest slis sudp < <(proc_sockets "$pid")
   add 'NET   sockets %s (established %s, listen %s, udp %s)' "$stotal" "$sest" "$slis" "$sudp"
   local sbusy=$(( (CUR_CPU_TOTAL-CUR_CPU_IDLE) - (PRE_CPU_TOTAL-PRE_CPU_IDLE) )) sdt=$(( CUR_CPU_TOTAL - PRE_CPU_TOTAL ))
   local sb_pct
-  sb_pct=$(pct10 "$sbusy" "$sdt")
+  v_pct10 "$sbusy" "$sdt"; sb_pct=$PCT10
   read_mem
+  local shcpu sc2 smem sswap stc stg
+  v_hcp "$sb_pct"; shcpu=$HCP
+  v_cores2 "$sbusy" "$e"; sc2=$CORES2
+  v_fmt_kib "$MEM_AVAIL"; smem=$FMTB
+  v_fmt_kib $(( SWAP_TOTAL - SWAP_FREE )); sswap=$FMTB
+  read_temp_v "$HWM_CPU"; v_temp "$TEMP"; stc=$TEMPC
+  read_temp_v "$HWM_GPU"; v_temp "$TEMP"; stg=$TEMPC
   add 'SYS   CPU %s%% (%s/%s)   RAM avail %s   swap %s   TEMP CPU %s GPU %s' \
-    "$(hcp "$sb_pct")" "$(cores2 "$sbusy" "$e")" "$ncores" \
-    "$(fmt_kib_b "$MEM_AVAIL")" "$(fmt_kib_b $(( SWAP_TOTAL - SWAP_FREE )))" \
-    "$(temp_c "$(read_temp "$HWM_CPU")")" "$(temp_c "$(read_temp "$HWM_GPU")")"
+    "$shcpu" "$sc2" "$ncores" "$smem" "$sswap" "$stc" "$stg"
 }
 
 render_footer() {
@@ -795,6 +1028,14 @@ while :; do
   fi
   CUR_NS=$(date +%s%N)
   ELAPSED_NS=$(( CUR_NS - PRE_NS )); (( ELAPSED_NS > 0 )) || ELAPSED_NS=1000000000
+  if [[ -z $TARGET ]]; then
+    ENG_DELTA=(); ENG_TOTAL=()
+    for pid in "${CUR_GPU_PIDS[@]}"; do
+      engine_delta_v "${PRE_GPU_ENGINES[$pid]:-}" "${CUR_GPU_ENGINES[$pid]:-}"
+      ENG_DELTA[$pid]=$ENGDELTA
+      ENG_TOTAL[$pid]=$ENGTOTAL
+    done
+  fi
   FRAME=""
   update_layout
   render_header
