@@ -264,14 +264,17 @@ proc_sockets() {  # $1=pid -> "total established listen udp"
 }
 
 proc_gpu() {  # $1=pid -> "vram_kib gtt_kib engine_ns evicted_kib"
-  awk '
+  # fdinfo files can vanish while a busy process opens/closes fds; gawk aborts
+  # on a missing input file, so feed it through cat (which skips failures).
+  find /proc/"$1"/fdinfo -maxdepth 1 -type f -exec cat {} + 2>/dev/null | awk '
     /^drm-client-id:/ {cid=$2}
+    /^drm-pdev:/ {pdev=$2; gsub(/[:.]/, "_", pdev)}
     /^drm-memory-vram:/ {if(cid!="" && !(cid in v)) v[cid]=$2+0}
     /^drm-memory-gtt:/  {if(cid!="" && !(cid in g)) g[cid]=$2+0}
     /^drm-engine-/ {
-      if (cid != "") {
+      if (cid != "" && pdev != "") {
         name=$1; sub(/^drm-engine-/, "", name); sub(/:$/, "", name)
-        key=cid SUBSEP name
+        key=pdev SUBSEP cid SUBSEP name
         if (!(key in em)) em[key]=$2+0
       }
     }
@@ -281,21 +284,38 @@ proc_gpu() {  # $1=pid -> "vram_kib gtt_kib engine_ns evicted_kib"
       for(c in v)tv+=v[c]; for(c in g)tg+=g[c]
       for(c in ev)tev+=ev[c]
       eng=""
-      for(k in em){split(k,a,SUBSEP); te+=em[k]; eng=eng a[2] ":" em[k] " "}
+      for(k in em){split(k,a,SUBSEP); te+=em[k]; eng=eng a[1] "/" a[2] "/" a[3] "=" em[k] " "}
       printf "%d %d %d %d %s\n", tv, tg, te, tev, eng
     }
-  ' /proc/"$1"/fdinfo/* 2>/dev/null
+  '
 }
 
-engine_deltas() {  # $1=prev "name:ns ..." $2=cur -> "name ns" for positive deltas
-  local -A P=() C=()
-  local kv name d
-  for kv in $1; do P[${kv%%:*}]=${kv#*:}; done
-  for kv in $2; do C[${kv%%:*}]=${kv#*:}; done
-  for name in "${!C[@]}"; do
-    d=$(( C[$name] - ${P[$name]:-${C[$name]}} ))
-    (( d > 0 )) && printf '%s %d\n' "$name" "$d"
+engine_deltas() {  # $1=prev $2=cur, entries "client/engine:ns"; only matching clients count
+  local -A P=() C=() D=()
+  local kv key name d
+  for kv in $1; do P[${kv%%=*}]=${kv#*=}; done
+  for kv in $2; do C[${kv%%=*}]=${kv#*=}; done
+  for key in "${!C[@]}"; do
+    [[ -n ${P[$key]+x} ]] || continue        # new client/engine: no baseline yet
+    d=$(( C[$key] - P[$key] ))
+    (( d > 0 )) || continue                  # counter reset or idle
+    name=${key##*/}
+    D[$name]=$(( ${D[$name]:-0} + d ))
   done
+  for name in "${!D[@]}"; do printf '%s %d\n' "$name" "${D[$name]}"; done
+}
+
+engine_total_delta() {  # $1=prev $2=cur -> total ns over matching client/engine pairs
+  local -A P=() C=()
+  local kv key d total=0
+  for kv in $1; do P[${kv%%=*}]=${kv#*=}; done
+  for kv in $2; do C[${kv%%=*}]=${kv#*=}; done
+  for key in "${!C[@]}"; do
+    [[ -n ${P[$key]+x} ]] || continue
+    d=$(( C[$key] - P[$key] ))
+    (( d > 0 )) && total=$(( total + d ))
+  done
+  printf '%d' "$total"
 }
 
 snapshot_proc() {  # $1=tag $2=pid
@@ -599,7 +619,7 @@ render_system() {
     local engine_total=0
     for pid in "${CUR_GPU_PIDS[@]}"; do
       [[ -n ${PRE_GPU_ENG[$pid]+x} ]] || continue
-      d=$(( CUR_GPU_ENG[$pid] - PRE_GPU_ENG[$pid] ))
+      d=$(engine_total_delta "${PRE_GPU_ENGINES[$pid]:-}" "${CUR_GPU_ENGINES[$pid]:-}")
       (( d > 0 )) && engine_total=$(( engine_total + d ))
     done
     local use_engine=0; (( engine_total > 0 )) && use_engine=1
@@ -610,9 +630,36 @@ render_system() {
       add '%sTOP GPU%s  (by VRAM; no engine counters)' "$C_BOLD" "$C_RESET"
       add '%s  %-8s %10s  %s%s' "$C_DIM" PID VRAM COMMAND "$C_RESET"
     fi
+    local -a grows=()
     local gkey gv
     while read -r gkey gv pid; do
       [[ -n $pid ]] || continue
+      grows+=("$gkey $gv $pid")
+    done < <(
+      for pid in "${CUR_GPU_PIDS[@]}"; do
+        if (( use_engine )); then
+          d=$(engine_total_delta "${PRE_GPU_ENGINES[$pid]:-}" "${CUR_GPU_ENGINES[$pid]:-}")
+          echo "$d ${CUR_GPU_VRAM[$pid]:-0} $pid"
+        else
+          echo "${CUR_GPU_VRAM[$pid]:-0} 0 $pid"
+        fi
+      done | sort -k1,1rn -k2,2rn | head -"$ROWS_GPU"
+    )
+    # keep the biggest VRAM holder visible even while its engine is idle
+    local top_vram_pid="" top_vram=0 v row seen=0
+    for pid in "${CUR_GPU_PIDS[@]}"; do
+      v=${CUR_GPU_VRAM[$pid]:-0}
+      if (( v > top_vram )); then top_vram=$v; top_vram_pid=$pid; fi
+    done
+    if [[ -n $top_vram_pid ]]; then
+      for row in "${grows[@]}"; do [[ ${row##* } == "$top_vram_pid" ]] && seen=1; done
+      if (( ! seen )); then
+        (( ${#grows[@]} >= ROWS_GPU )) && grows=("${grows[@]:0:$(( ROWS_GPU - 1 ))}")
+        grows+=("0 $top_vram $top_vram_pid")
+      fi
+    fi
+    for row in "${grows[@]}"; do
+      set -- $row; gkey=$1; gv=$2; pid=$3
       if (( use_engine )); then
         local gpct gpad
         gpct=$(pct10 "$gkey" "$ELAPSED_NS")
@@ -621,18 +668,7 @@ render_system() {
       else
         add '  %-8s %10s  %s' "$pid" "$(fmt_kib_b "${CUR_GPU_VRAM[$pid]:-0}")" "$(proc_label "$pid")"
       fi
-    done < <(
-      for pid in "${CUR_GPU_PIDS[@]}"; do
-        if (( use_engine )); then
-          d=0
-          [[ -n ${PRE_GPU_ENG[$pid]+x} ]] && d=$(( CUR_GPU_ENG[$pid] - PRE_GPU_ENG[$pid] ))
-          (( d < 0 )) && d=0
-          echo "$d ${CUR_GPU_VRAM[$pid]:-0} $pid"
-        else
-          echo "${CUR_GPU_VRAM[$pid]:-0} 0 $pid"
-        fi
-      done | sort -k1,1rn -k2,2rn | head -"$ROWS_GPU"
-    )
+    done
   fi
 }
 
@@ -695,7 +731,7 @@ render_proc() {
   read -r vu vt gu gt < <(gpu_sysfs)
   if (( CUR_PV > 0 )); then
     local eng_pct pvram_pct eline="" ename ens
-    eng_pct=$(pct10 $(( CUR_ENGINE - PRE_ENGINE )) "$ELAPSED_NS")
+    eng_pct=$(pct10 "$(engine_total_delta "$PRE_PENGINES" "$CUR_PENGINES")" "$ELAPSED_NS")
     pvram_pct=$(( vt ? 100 * (CUR_PV * 1024) / vt : 0 ))
     while read -r ename ens; do
       eline+="$ename $(hcp "$(pct10 "$ens" "$ELAPSED_NS")")%   "
