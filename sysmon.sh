@@ -485,10 +485,45 @@ proc_label() { proc_label_v "$1"; printf '%s' "$LABEL"; }
 proc_rss_kb() { local sz r rest; read -r sz r rest < /proc/"$1"/statm 2>/dev/null && echo $(( r * PAGE_KB )) || echo 0; }
 rss_kb_v() { local sz r rest; RSS_KB=0; read -r sz r rest < /proc/"$1"/statm 2>/dev/null && RSS_KB=$(( r * PAGE_KB )); }
 proc_swap_kb() { awk '/^VmSwap:/{print $2; exit}' /proc/"$1"/status 2>/dev/null; }
+proc_swap_kb_v() {
+  local k v u; SWAP_KB=0
+  while read -r k v u; do [[ $k == VmSwap: ]] && { SWAP_KB=${v:-0}; break; }; done < /proc/"$1"/status 2>/dev/null
+}
+
+read_smaps_v() {  # $1=pid -> SMAPS_RSS/PSS/ANON/SHARED/PRIVATE/SWAP (KiB)
+  SMAPS_RSS=0; SMAPS_PSS=0; SMAPS_ANON=0; SMAPS_SHARED=0; SMAPS_PRIVATE=0; SMAPS_SWAP=0
+  local k v u
+  while read -r k v u; do
+    case $k in
+      Rss:) SMAPS_RSS=${v:-0} ;;
+      Pss:) SMAPS_PSS=${v:-0} ;;
+      Anonymous:) SMAPS_ANON=${v:-0} ;;
+      Shared_Clean:|Shared_Dirty:) SMAPS_SHARED=$(( SMAPS_SHARED + ${v:-0} )) ;;
+      Private_Clean:|Private_Dirty:) SMAPS_PRIVATE=$(( SMAPS_PRIVATE + ${v:-0} )) ;;
+      Swap:) SMAPS_SWAP=${v:-0} ;;
+    esac
+  done < /proc/"$1"/smaps_rollup 2>/dev/null
+}
+
+read_status_mem_v() {  # $1=pid -> STA_PEAK/VIRT/DATA/STK/EXE/LIB/PTE (KiB)
+  STA_PEAK=0; STA_VIRT=0; STA_DATA=0; STA_STK=0; STA_EXE=0; STA_LIB=0; STA_PTE=0
+  local k v u
+  while read -r k v u; do
+    case $k in
+      VmPeak:) STA_PEAK=${v:-0} ;;
+      VmSize:) STA_VIRT=${v:-0} ;;
+      VmData:) STA_DATA=${v:-0} ;;
+      VmStk:) STA_STK=${v:-0} ;;
+      VmExe:) STA_EXE=${v:-0} ;;
+      VmLib:) STA_LIB=${v:-0} ;;
+      VmPTE:) STA_PTE=${v:-0} ;;
+    esac
+  done < /proc/"$1"/status 2>/dev/null
+}
 
 # ---------- rendering ----------
 tty_ok=0; [[ -t 1 ]] && tty_ok=1
-TERM_COLS=80; TERM_LINES=24; ROWS_CPU=5; ROWS_GPU=5
+TERM_COLS=80; TERM_LINES=24; ROWS_CPU=5; ROWS_GPU=5; ROWS_MEM=5
 LAYOUT_AGE=999
 update_layout() {
   (( LAYOUT_AGE < 5 )) && { LAYOUT_AGE=$(( LAYOUT_AGE + 1 )); return; }
@@ -503,11 +538,13 @@ update_layout() {
   [[ $TERM_LINES =~ ^[0-9]+$ ]] || TERM_LINES=24
   (( TERM_COLS < 40 )) && TERM_COLS=40
   (( TERM_LINES < 12 )) && TERM_LINES=12
-  local avail=$(( TERM_LINES - 18 ))
-  (( avail < 2 )) && avail=2
-  ROWS_CPU=$(( avail / 2 ))
+  local avail=$(( TERM_LINES - 21 ))
+  (( avail < 3 )) && avail=3
+  ROWS_CPU=$(( avail / 3 ))
   (( ROWS_CPU > 5 )) && ROWS_CPU=5
+  (( ROWS_CPU < 1 )) && ROWS_CPU=1
   ROWS_GPU=$ROWS_CPU
+  ROWS_MEM=$ROWS_CPU
 }
 USE_COLOR=0
 if [[ $COLOR_MODE == always ]]; then
@@ -796,9 +833,20 @@ render_system() {
     for pid in "${!CUR_PROC_TICKS[@]}"; do
       [[ -n ${PRE_PROC_TICKS[$pid]+x} ]] || continue
       d=$(( CUR_PROC_TICKS[$pid] - PRE_PROC_TICKS[$pid] ))
-      (( d > 0 )) && echo "$(awk -v d="$d" -v e="$e" 'BEGIN{printf "%d", d*1000/e}') $pid"
+      (( d > 0 )) && echo "$(( d * 1000 / e )) $pid"
     done | sort -rn | head -"$ROWS_CPU"
   )
+  add ''
+  add '%sTOP MEM%s  (RSS; swap shown for listed rows)' "$C_BOLD" "$C_RESET"
+  add '%s  %-8s %10s %10s  %s%s' "$C_DIM" PID RSS SWAP COMMAND "$C_RESET"
+  local mpid mrss mrv msv
+  while read -r mpid mrss; do
+    [[ -n $mpid && $mrss =~ ^[0-9]+$ ]] || continue
+    v_fmt_kib "$mrss"; mrv=$FMTB
+    proc_swap_kb_v "$mpid"; v_fmt_kib "$SWAP_KB"; msv=$FMTB
+    proc_label_v "$mpid"
+    add '  %-8s %10s %10s  %s' "$mpid" "$mrv" "$msv" "$LABEL"
+  done < <(ps -eo pid=,rss= --sort=-rss 2>/dev/null | head -n "$ROWS_MEM")
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     add ''
     local engine_total=0
@@ -934,6 +982,29 @@ render_proc() {
   add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s' \
     "$C_BOLD" "$plabel" "$C_RESET" "$pid" "$rssv" "$swapv" "${#CUR_THREAD_TICKS[@]}"
   add 'CPU   %s%s%% (%s cores of %s)' "$barp" "$hcpu" "$cores2v" "$ncores"
+  read_smaps_v "$pid"
+  if (( SMAPS_RSS > 0 )); then
+    local m1 m2 m3 m4 m5 m6
+    v_fmt_kib "$SMAPS_RSS"; m1=$FMTB
+    v_fmt_kib "$SMAPS_ANON"; m2=$FMTB
+    v_fmt_kib "$SMAPS_SHARED"; m3=$FMTB
+    v_fmt_kib "$SMAPS_PRIVATE"; m4=$FMTB
+    v_fmt_kib "$SMAPS_PSS"; m5=$FMTB
+    v_fmt_kib "$SMAPS_SWAP"; m6=$FMTB
+    add 'MEM   rss %s (anon %s, shared %s, private %s)   pss %s   swap %s' "$m1" "$m2" "$m3" "$m4" "$m5" "$m6"
+  fi
+  read_status_mem_v "$pid"
+  if (( STA_VIRT > 0 )); then
+    local s1 s2 s3 s4 s5 s6 s7
+    v_fmt_kib "$STA_VIRT"; s1=$FMTB
+    v_fmt_kib "$STA_PEAK"; s2=$FMTB
+    v_fmt_kib "$STA_DATA"; s3=$FMTB
+    v_fmt_kib "$STA_STK"; s4=$FMTB
+    v_fmt_kib "$STA_EXE"; s5=$FMTB
+    v_fmt_kib "$STA_LIB"; s6=$FMTB
+    v_fmt_kib "$STA_PTE"; s7=$FMTB
+    add 'MEM   virt %s   peak %s   data %s   stack %s   exe %s   lib %s   pte %s' "$s1" "$s2" "$s3" "$s4" "$s5" "$s6" "$s7"
+  fi
   add '%sTHREADS%s  (top 5 by CPU; 100%% = one core)' "$C_BOLD" "$C_RESET"
   local tid p10 pv ppad trows=0
   while read -r p10 tid; do
@@ -945,7 +1016,7 @@ render_proc() {
     for tid in "${!CUR_THREAD_TICKS[@]}"; do
       [[ -n ${PRE_THREAD_TICKS[$tid]+x} ]] || continue
       d=$(( CUR_THREAD_TICKS[$tid] - PRE_THREAD_TICKS[$tid] ))
-      (( d > 0 )) && echo "$(awk -v d="$d" -v e="$e" 'BEGIN{printf "%d", d*1000/e}') $tid"
+      (( d > 0 )) && echo "$(( d * 1000 / e )) $tid"
     done | sort -rn | head -"$ROWS_CPU"
   )
   (( trows > 0 )) || add '  %s(no thread activity in this interval)%s' "$C_DIM" "$C_RESET"
@@ -1007,7 +1078,7 @@ render_proc() {
 render_footer() {
   add ''
   add '%sVRAM near 100%% + GTT/evicted rising = texture thrash;  gfx near 100%% = GPU-bound;%s' "$C_DIM" "$C_RESET"
-  add '%sone thread near 100%% while cores idle = single-core bound.  Ctrl-C quits.%s' "$C_DIM" "$C_RESET"
+  (( TERM_LINES >= 28 )) && add '%sone thread near 100%% while cores idle = single-core bound.  Ctrl-C quits.%s' "$C_DIM" "$C_RESET"
 }
 
 # ---------- main loop ----------

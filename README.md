@@ -28,6 +28,8 @@ TOP GPU  (engine busy, last 1s)
   磁盘读写、CPU/GPU/NVMe 温度、按 CPU 排序的进程列表。
 - **TOP GPU**：按 GPU 引擎占用排序的进程列表，同时给出每个进程占用的显存；
   没有引擎计数器时自动改为按显存排序。
+- **TOP MEM**：按 RSS 排序的进程列表（附各自 swap）；进程模式还会给出
+  RSS 构成（anon/shared/private）、PSS、swap，以及 virt/peak/data/stack/exe/lib/pte 明细。
 - **GPU 引擎细分**：系统模式增加 `ENGINE` 行、进程模式列出各引擎占用，
   可区分 3D 渲染、视频解码、视频编码、显存拷贝，直接判断软解还是硬解。
 - **网络**：系统模式显示各网卡的实时收发速率（自动列出有流量的网卡），
@@ -101,6 +103,7 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `DISK` | 根分区所在磁盘的实时读写速率 |
 | `NET` | 各网卡的实时收发速率；只显示有流量的网卡，默认路由网卡空闲时也会显示 |
 | `TOP GPU` | 按 GPU 引擎占用排序的前 5 个进程，附各自的显存占用；无引擎计数器时按显存排序 |
+| `TOP MEM` | 按 RSS 排序的前几个进程，并列出各自的 swap 用量 |
 | `ENGINE` | 各 GPU 引擎的整机占用（3D、视频解码、编码等），仅显示有活动的引擎 |
 
 ### 进程模式
@@ -119,6 +122,7 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `evicted` | 被换出到系统内存的显存（持续增长说明显存不够） |
 | `RSS` / `swap` | 物理内存 / 已换出的进程内存 |
 | `NET` | 该进程持有的套接字总数，以及其中 TCP 已建立、监听和 UDP 的数量 |
+| `MEM` | 该进程 `rss`（含 anon/shared/private 构成）、`pss`、`swap`；下一行是 `virt`/`peak`/`data`/`stack`/`exe`/`lib`/`pte` 明细 |
 
 > `COMMAND` / `PROC` / `THREADS` 里的名字来自 `/proc/<pid>/comm`，
 > 这是程序自己可以改的标签（最长 15 字符），并不一定是可执行文件名。

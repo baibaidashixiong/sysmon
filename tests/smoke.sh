@@ -35,6 +35,8 @@ grep -q '^MEM' <<<"$out"
 report $? 'system mode reports MEM'
 grep -q '^NET' <<<"$out"
 report $? 'system mode reports NET'
+grep -q '^TOP MEM' <<<"$out"
+report $? 'system mode reports TOP MEM'
 
 out=$(./sysmon.sh -i 1 -n 1 -p "$$" 2>&1)
 report $? 'process mode runs'
@@ -42,6 +44,8 @@ grep -q '^PROC' <<<"$out"
 report $? 'process mode reports PROC'
 grep -q '^NET' <<<"$out"
 report $? 'process mode reports NET sockets'
+grep -q '^MEM' <<<"$out"
+report $? 'process mode reports memory detail'
 
 ./sysmon.sh -i 1 -n 1 -p NoSuchProcessXyz >/dev/null 2>&1
 [[ $? -ne 0 ]]
