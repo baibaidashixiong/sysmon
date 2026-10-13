@@ -38,6 +38,11 @@ report $? 'system mode reports NET'
 grep -q '^TOP MEM' <<<"$out"
 report $? 'system mode reports TOP MEM'
 
+out=$(./sysmon.sh -i 1 -n 1 -p -m 2>&1)
+report $? 'expanded memory mode runs'
+grep -q '^MEM   free' <<<"$out"
+report $? 'expanded memory shows meminfo breakdown'
+
 out=$(./sysmon.sh -i 1 -n 1 -p "$$" 2>&1)
 report $? 'process mode runs'
 grep -q '^PROC' <<<"$out"

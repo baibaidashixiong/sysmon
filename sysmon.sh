@@ -27,6 +27,7 @@ TARGET=""
 COLOR_MODE=auto
 BARS=1
 GPU_TOP=1
+MEM_DETAIL=0
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 PAGE_KB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
 
@@ -44,6 +45,7 @@ Options:
   -p           plain output (no colors, no bars)
   -c           force colors even when output is piped
   -G           skip the TOP GPU process table
+  -m           expanded memory breakdown (free/cached/slab/anon/commit/swap IO)
   -v           print version
   -h           show this help
 
@@ -54,13 +56,14 @@ Examples:
 EOF
 }
 
-while getopts ":i:n:pcvGh" opt; do
+while getopts ":i:n:pcvGmh" opt; do
   case $opt in
     i) INTERVAL=$OPTARG ;;
     n) COUNT=$OPTARG ;;
     p) COLOR_MODE=never; BARS=0 ;;
     c) COLOR_MODE=always ;;
     G) GPU_TOP=0 ;;
+    m) MEM_DETAIL=1 ;;
     v) echo "sysmon $VERSION"; exit 0 ;;
     h) usage; exit 0 ;;
     \?) echo "unknown option: -$OPTARG" >&2; usage; exit 1 ;;
@@ -75,14 +78,31 @@ TARGET=${1:-}
 
 # ---------- hardware handles ----------
 GPU_DEV=""
+GPU_MODEL=""
+GPU_VRAM_OK=0
+_best=0
 for c in /sys/class/drm/card*/device; do
-  [[ -r $c/mem_info_vram_total ]] && { GPU_DEV=$c; break; }
+  [[ -r $c/mem_info_vram_total ]] || continue
+  _t=0
+  read -r _t 2>/dev/null < "$c/mem_info_vram_total"
+  [[ $_t =~ ^[0-9]+$ ]] || _t=0
+  if (( _t > _best )); then _best=$_t; GPU_DEV=$c; fi
 done
+unset _best _t
+if [[ -n $GPU_DEV ]]; then
+  read -r _t 2>/dev/null < "$GPU_DEV/mem_info_vram_total" || _t=0
+  (( ${_t:-0} > 0 )) && GPU_VRAM_OK=1
+  unset _t
+fi
 GPU_DRIVER=""
 [[ -n $GPU_DEV ]] && GPU_DRIVER=$(basename "$(readlink -f "$GPU_DEV/driver" 2>/dev/null)" 2>/dev/null)
 NVIDIA=0
 command -v nvidia-smi >/dev/null 2>&1 && NVIDIA=1
 [[ -z $GPU_DRIVER && $NVIDIA == 1 ]] && GPU_DRIVER=nvidia
+if command -v lspci >/dev/null 2>&1; then
+  GPU_MODEL=$(lspci 2>/dev/null | awk '/VGA compatible controller|3D controller|Display controller/ {sub(/^.*: */, ""); print; exit}')
+  [[ $GPU_MODEL == *'['*']'* ]] && GPU_MODEL=$(printf '%s' "$GPU_MODEL" | sed 's/.*\[\([^]]*\)\].*/\1/')
+fi
 
 find_hwmon() {
   local h
@@ -155,13 +175,32 @@ rate_b() {
 }
 read_mem() {
   MEM_TOTAL=0; MEM_AVAIL=0; SWAP_TOTAL=0; SWAP_FREE=0
+  MEM_FREE=0; MEM_BUFFERS=0; MEM_CACHED=0; MEM_SHMEM=0
+  MEM_SLAB=0; MEM_SRECLAIM=0; MEM_PGTAB=0
+  MEM_ANON=0; MEM_MAPPED=0; MEM_ACTIVE=0; MEM_INACTIVE=0
+  MEM_DIRTY=0; MEM_WRITEBACK=0; MEM_COMMIT=0; MEM_COMMITLIM=0; MEM_SWAPCACHED=0
   local k v
   while read -r k v _; do
     case $k in
       MemTotal:) MEM_TOTAL=$v ;; MemAvailable:) MEM_AVAIL=$v ;;
       SwapTotal:) SWAP_TOTAL=$v ;; SwapFree:) SWAP_FREE=$v ;;
+      MemFree:) MEM_FREE=$v ;; Buffers:) MEM_BUFFERS=$v ;; Cached:) MEM_CACHED=$v ;;
+      Shmem:) MEM_SHMEM=$v ;; Slab:) MEM_SLAB=$v ;; SReclaimable:) MEM_SRECLAIM=$v ;;
+      PageTables:) MEM_PGTAB=$v ;; AnonPages:) MEM_ANON=$v ;; Mapped:) MEM_MAPPED=$v ;;
+      Active:) MEM_ACTIVE=$v ;; Inactive:) MEM_INACTIVE=$v ;;
+      Dirty:) MEM_DIRTY=$v ;; Writeback:) MEM_WRITEBACK=$v ;;
+      Committed_AS:) MEM_COMMIT=$v ;; CommitLimit:) MEM_COMMITLIM=$v ;;
+      SwapCached:) MEM_SWAPCACHED=$v ;;
     esac
   done < /proc/meminfo
+}
+
+read_vmstat_swap() {  # sets PSWPIN/PSWPOUT (pages since boot)
+  PSWPIN=0; PSWPOUT=0
+  local k v
+  while read -r k v _; do
+    case $k in pswpin:) PSWPIN=$v ;; pswpout:) PSWPOUT=$v ;; esac
+  done < /proc/vmstat
 }
 psi10() {
   local f=$1 want=$2 line x
@@ -492,6 +531,7 @@ proc_swap_kb_v() {
 
 read_smaps_v() {  # $1=pid -> SMAPS_RSS/PSS/ANON/SHARED/PRIVATE/SWAP (KiB)
   SMAPS_RSS=0; SMAPS_PSS=0; SMAPS_ANON=0; SMAPS_SHARED=0; SMAPS_PRIVATE=0; SMAPS_SWAP=0
+  SMAPS_PSS_ANON=0; SMAPS_PSS_FILE=0; SMAPS_SWAP_PSS=0; SMAPS_LOCKED=0; SMAPS_HUGE=0
   local k v u
   while read -r k v u; do
     case $k in
@@ -501,6 +541,11 @@ read_smaps_v() {  # $1=pid -> SMAPS_RSS/PSS/ANON/SHARED/PRIVATE/SWAP (KiB)
       Shared_Clean:|Shared_Dirty:) SMAPS_SHARED=$(( SMAPS_SHARED + ${v:-0} )) ;;
       Private_Clean:|Private_Dirty:) SMAPS_PRIVATE=$(( SMAPS_PRIVATE + ${v:-0} )) ;;
       Swap:) SMAPS_SWAP=${v:-0} ;;
+      Pss_Anon:) SMAPS_PSS_ANON=${v:-0} ;;
+      Pss_File:) SMAPS_PSS_FILE=${v:-0} ;;
+      SwapPss:) SMAPS_SWAP_PSS=${v:-0} ;;
+      Locked:) SMAPS_LOCKED=${v:-0} ;;
+      AnonHugePages:) SMAPS_HUGE=${v:-0} ;;
     esac
   done < /proc/"$1"/smaps_rollup 2>/dev/null
 }
@@ -538,7 +583,9 @@ update_layout() {
   [[ $TERM_LINES =~ ^[0-9]+$ ]] || TERM_LINES=24
   (( TERM_COLS < 40 )) && TERM_COLS=40
   (( TERM_LINES < 12 )) && TERM_LINES=12
-  local avail=$(( TERM_LINES - 21 ))
+  local extra=0
+  (( MEM_DETAIL )) && extra=3
+  local avail=$(( TERM_LINES - 21 - extra ))
   (( avail < 3 )) && avail=3
   ROWS_CPU=$(( avail / 3 ))
   (( ROWS_CPU > 5 )) && ROWS_CPU=5
@@ -709,10 +756,12 @@ clip_line_v() {  # sets CLIPPED: $1 = line with ANSI codes, $2 = max visible cha
 clip_line() { clip_line_v "$1" "$2"; printf '%s' "$CLIPPED"; }
 
 emit_frame() {  # single write, line-by-line truncation, no stale fragments
-  local out="" line
+  local out="" line n=0 max=$(( TERM_LINES - 1 ))
   while IFS= read -r line; do
+    (( n >= max )) && break
     clip_line_v "$line" $(( TERM_COLS - 1 ))
     out+="$CLIPPED"$'\033[K\n'
+    (( n++ ))
   done <<< "$FRAME"
   printf '\033[?2026h\033[H%s\033[J\033[?2026l' "$out"
 }
@@ -778,10 +827,49 @@ render_system() {
   add 'MEM   %s%s%%   %s / %s used   avail %s   swap %s / %s (%s%%)   %s%s%s' \
     "$barm" "$hm" "$f1" "$f2" "$f3" "$f4" "$f5" "$swap_pct" \
     "$mcolor" "$msign$FMTM/s" "$C_RESET"
+  if (( MEM_DETAIL )); then
+    local e1 e2 e3 e4 e5 e6 e7 commit_pct=0
+    v_fmt_mem "$MEM_FREE"; e1=$FMTM
+    v_fmt_mem "$MEM_BUFFERS"; e2=$FMTM
+    v_fmt_mem "$MEM_CACHED"; e3=$FMTM
+    v_fmt_mem "$MEM_SHMEM"; e4=$FMTM
+    v_fmt_mem "$MEM_SLAB"; e5=$FMTM
+    v_fmt_mem "$MEM_SRECLAIM"; e6=$FMTM
+    v_fmt_mem "$MEM_PGTAB"; e7=$FMTM
+    add 'MEM   free %s   buffers %s   cached %s   shmem %s   slab %s (reclaimable %s)   pagetables %s' \
+      "$e1" "$e2" "$e3" "$e4" "$e5" "$e6" "$e7"
+    v_fmt_mem "$MEM_ANON"; e1=$FMTM
+    v_fmt_mem "$MEM_MAPPED"; e2=$FMTM
+    v_fmt_mem "$MEM_ACTIVE"; e3=$FMTM
+    v_fmt_mem "$MEM_INACTIVE"; e4=$FMTM
+    v_fmt_mem "$MEM_DIRTY"; e5=$FMTM
+    v_fmt_mem "$MEM_WRITEBACK"; e6=$FMTM
+    add 'MEM   anon %s   mapped %s   active %s   inactive %s   dirty %s   writeback %s' \
+      "$e1" "$e2" "$e3" "$e4" "$e5" "$e6"
+    (( MEM_COMMITLIM > 0 )) && commit_pct=$(( 100 * MEM_COMMIT / MEM_COMMITLIM ))
+    v_fmt_mem "$MEM_COMMIT"; e1=$FMTM
+    v_fmt_mem "$MEM_COMMITLIM"; e2=$FMTM
+    v_fmt_mem "$MEM_SWAPCACHED"; e3=$FMTM
+    v_rate $(( ${SWAPIN_PAGES:-0} * PAGE_KB * 1024 )) "$ELAPSED_NS"; v_fmt_b "$RATE"; e4=$FMTB
+    v_rate $(( ${SWAPOUT_PAGES:-0} * PAGE_KB * 1024 )) "$ELAPSED_NS"; v_fmt_b "$RATE"; e5=$FMTB
+    add 'MEM   commit %s / %s (%s%%)   swapcached %s   swap in/out %s/s / %s/s' \
+      "$e1" "$e2" "$commit_pct" "$e3" "$e4" "$e5"
+  fi
   local vu vt gu gt
   gpu_sysfs_v; vu=$GPU_VU; vt=$GPU_VT; gu=$GPU_GU; gt=$GPU_GT
   local vram_pct=$(( vt ? 100 * vu / vt : 0 )) gtt_pct=$(( gt ? 100 * gu / gt : 0 ))
   local barg="" hv v1 v2 v3 gtv
+  if (( vt <= 0 )); then
+    # driver does not expose mem_info_vram_total (old radeon, vfio, headless...)
+    local u1 u2
+    gpu_sysfs_v
+    v_fmt_b "$GPU_VU"; u1=$FMTB
+    v_fmt_b "$GPU_GU"; u2=$FMTB
+    read_temp_v "$HWM_GPU"; v_temp "$TEMP"
+    add 'GPU   %s   VRAM n/a (driver has no mem_info_vram_total)%s%s' \
+      "${GPU_MODEL:-unknown GPU}" "${GPU_GU:+   GTT $u2}" "$( [[ -n $TEMP ]] && printf '   temp %s' "$TEMPC" )"
+    add '%s      read %s used   check: ls /sys/class/drm/card*/device/mem_info_vram_total%s' "$C_DIM" "$u1" "$C_RESET"
+  else
   if (( BARS )); then v_bar "$vram_pct" 12; barg="$BAR "; fi
   v_hcp "$vram_pct"; hv=$HCP
   v_fmt_b "$vu"; v1=$FMTB
@@ -793,6 +881,7 @@ render_system() {
   if [[ -n $gbusy ]]; then v_hcp "$gbusy"; gb="   busy $HCP%"; fi
   add 'GPU   %sVRAM %s%%   %s / %s   GTT %s (%s%%)   temp %s%s' \
     "$barg" "$hv" "$v1" "$v2" "$v3" "$gtt_pct" "$gtv" "$gb"
+  fi
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     local -A engsum=()
     local epid ename ens i
@@ -1017,6 +1106,16 @@ render_proc() {
     v_fmt_mem "$SMAPS_PSS"; m5=$FMTM
     v_fmt_mem "$SMAPS_SWAP"; m6=$FMTM
     add 'MEM   rss %s (anon %s, shared %s, private %s)   pss %s   swap %s' "$m1" "$m2" "$m3" "$m4" "$m5" "$m6"
+    if (( MEM_DETAIL )); then
+      local n1 n2 n3 n4 n5
+      v_fmt_mem "$SMAPS_PSS_ANON"; n1=$FMTM
+      v_fmt_mem "$SMAPS_PSS_FILE"; n2=$FMTM
+      v_fmt_mem "$SMAPS_SWAP_PSS"; n3=$FMTM
+      v_fmt_mem "$SMAPS_LOCKED"; n4=$FMTM
+      v_fmt_mem "$SMAPS_HUGE"; n5=$FMTM
+      add 'MEM   pss-anon %s   pss-file %s   swapped-pss %s   locked %s   anon-huge %s' \
+        "$n1" "$n2" "$n3" "$n4" "$n5"
+    fi
   fi
   read_status_mem_v "$pid"
   if (( STA_VIRT > 0 )); then
@@ -1139,6 +1238,15 @@ while :; do
   MEM_USED_KIB=$(( MEM_TOTAL - MEM_AVAIL ))
   if [[ -n ${PRE_MEM_KIB:-} ]]; then MEM_DELTA_KIB=$(( MEM_USED_KIB - PRE_MEM_KIB )); else MEM_DELTA_KIB=0; fi
   PRE_MEM_KIB=$MEM_USED_KIB
+  read_vmstat_swap
+  if [[ -n ${PRE_PSWPIN:-} ]]; then
+    SWAPIN_PAGES=$(( PSWPIN - PRE_PSWPIN )); SWAPOUT_PAGES=$(( PSWPOUT - PRE_PSWPOUT ))
+    (( SWAPIN_PAGES < 0 )) && SWAPIN_PAGES=0
+    (( SWAPOUT_PAGES < 0 )) && SWAPOUT_PAGES=0
+  else
+    SWAPIN_PAGES=0; SWAPOUT_PAGES=0
+  fi
+  PRE_PSWPIN=$PSWPIN; PRE_PSWPOUT=$PSWPOUT
   if [[ -z $TARGET ]]; then
     ENG_DELTA=(); ENG_TOTAL=()
     for pid in "${CUR_GPU_PIDS[@]}"; do

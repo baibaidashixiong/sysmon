@@ -34,6 +34,8 @@ TOP GPU  (engine busy, last 1s)
   可区分 3D 渲染、视频解码、视频编码、显存拷贝，直接判断软解还是硬解。
 - **网络**：系统模式显示各网卡的实时收发速率（自动列出有流量的网卡），
   进程模式显示该进程的套接字数量与 TCP 连接状态。
+- **可展开的内存明细**：`-m` 展开 free/cached/slab/anon/mapped/active/
+  commit/swap IO 等完整 `/proc/meminfo` 视图，进程模式同时给出 PSS 构成。
 - **进程模式**：按名字或 PID 自动识别进程，显示每线程 CPU、RSS、swap、
   该进程独占的 VRAM/GTT/evicted 显存、GPU 引擎占用率、进程磁盘 I/O。
 - **易读**：百分比按阈值着色（绿 <50%、黄 50-75%、红 75-90%、红底 >=90%），
@@ -83,6 +85,7 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `-p` | 纯文本输出，便于记日志 |
 | `-c` | 强制彩色输出（非终端时默认关色） |
 | `-G` | 不显示 TOP GPU 进程表（进程多、想省开销时可用） |
+| `-m` | 展开内存明细（系统模式 3 行 meminfo 分解；进程模式加 PSS 构成） |
 | `-v` | 打印版本 |
 | `-h` | 帮助 |
 
@@ -98,6 +101,17 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
 | `cores` | 每个逻辑核的占用率 |
 | `PSI` | `/proc/pressure` 的 `some/full` 平均值，反映任务被真实阻塞的时间比例 |
 | `MEM` | 已用/总量（百分比保留一位小数），swap 使用比例，以及末尾的实时变化速率 `+2.5M/s`（增长变黄/红，下降为绿色） |
+
+加上 `-m` 后，系统模式额外显示三行：
+
+```
+MEM   free 1.43G   buffers 146M   cached 5.39G   shmem 302M   slab 1.06G (reclaimable 762M)   pagetables 68.1M
+MEM   anon 4.81G   mapped 929M   active 4.91G   inactive 5.63G   dirty 1.4M   writeback 0K
+MEM   commit 39.2G / 26.8G (146%)   swapcached 438M   swap in/out 0.0B/s / 0.0B/s
+```
+
+`commit` 超过 100% 表示内存被超额承诺（常见于 Steam/游戏场景），
+`swap in/out` 持续非零说明已经开始用交换分区换页。
 | `GPU VRAM` | 显存占用；`GTT` 是 GPU 溢出到系统内存的部分 |
 | `busy` | GPU 整体利用率（驱动支持时显示） |
 | `DISK` | 根分区所在磁盘的实时读写速率 |
@@ -169,6 +183,11 @@ sysmon.sh -c | less -R           # 管道输出时强制颜色
   名字不在列表内时会显示 `--`。
 - NVIDIA 通过 `nvidia-smi` 读取整卡显存和利用率；单进程显存无法从 sysfs 获取，
   此时进程模式的 `VRAM` 显示为 `no DRM client found`。
+- 若所有 DRM 卡都没有 `mem_info_vram_total`（常见于旧 `radeon` 驱动、vfio
+  直通或非主显示设备），显存会显示为 `VRAM n/a` 并附上显卡型号，而不再是
+  容易误解的 `0.0B/0.0B`。在目标机器上可用
+  `ls /sys/class/drm/card*/device/mem_info_vram_*` 与
+  `lspci -k -s <BDF>`（看 Kernel driver 是 amdgpu 还是 radeon）确认原因。
 - 内核不提供单进程网络流量统计（`/proc/<pid>/net/dev` 是整个网络命名空间的），
   所以进程模式只能给出套接字与连接状态；要看每进程带宽可用 `nethogs`、
   `bandwhich`，按连接排查可用 `ss -tp`。
