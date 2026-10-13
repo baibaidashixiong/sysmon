@@ -592,7 +592,7 @@ temp_c() {  # $1 = integer degrees (may be empty) -> colored "<n>C"
 
 # no-fork variants: write to globals instead of spawning a subshell per value
 SEV=""; HCP=""; BAR=""; PCT10="0.0"; TENTHS="0.0"; CORES2="0.00"
-FMTB="0.0B"; RATE=0; TEMPC="--"; PSI="n/a"; TEMP=""
+FMTB="0.0B"; FMTM="0K"; RATE=0; TEMPC="--"; PSI="n/a"; TEMP=""
 v_sev() {
   local n=${1%%.*}; n=${n:-0}; (( n < 0 )) && n=0
   if (( n >= 90 )); then SEV=$C_HOT
@@ -632,6 +632,21 @@ v_fmt_b() {
   FMTB="$s$(( t / 10 )).$(( t % 10 ))$suf"
 }
 v_fmt_kib() { v_fmt_b $(( ${1:-0} * 1024 )); }
+v_fmt_mem() {  # $1 bytes? no: KiB -> adaptive precision (15.5G / 8.62G / 512M)
+  local kib=${1:-0} s="" t
+  (( kib < 0 )) && { s="-"; kib=$(( -kib )); }
+  if (( kib >= 10485760 )); then
+    t=$(( (kib * 10 + 524288) / 1048576 )); FMTM="$s$(( t / 10 )).$(( t % 10 ))G"
+  elif (( kib >= 1048576 )); then
+    t=$(( (kib * 100 + 524288) / 1048576 )); FMTM="$s$(( t / 100 )).$(printf '%02d' $(( t % 100 )))G"
+  elif (( kib >= 102400 )); then
+    FMTM="$s$(( (kib + 512) / 1024 ))M"
+  elif (( kib >= 1024 )); then
+    t=$(( (kib * 10 + 512) / 1024 )); FMTM="$s$(( t / 10 )).$(( t % 10 ))M"
+  else
+    FMTM="$s${kib}K"
+  fi
+}
 v_rate() {
   local d=${1:-0} ns=${2:-0} m=${3:-1} ms t
   if (( ns <= 0 )); then RATE=0; return; fi
@@ -744,15 +759,25 @@ render_system() {
   swap_used=$(( stotal - sfree ))
   swap_pct=$(( stotal ? 100 * swap_used / stotal : 0 ))
   local barm="" hm f1 f2 f3 f4 f5
+  local mem_pct_x
+  v_pct10 $(( used - avail )) "$used"; mem_pct_x=$PCT10
   if (( BARS )); then v_bar "$mem_pct" 12; barm="$BAR "; fi
-  v_hcp "$mem_pct"; hm=$HCP
-  v_fmt_kib $(( used - avail )); f1=$FMTB
-  v_fmt_kib "$used"; f2=$FMTB
-  v_fmt_kib "$avail"; f3=$FMTB
-  v_fmt_kib "$swap_used"; f4=$FMTB
-  v_fmt_kib "$stotal"; f5=$FMTB
-  add 'MEM   %s%s%%   %s / %s used   avail %s   swap %s / %s (%s%%)' \
-    "$barm" "$hm" "$f1" "$f2" "$f3" "$f4" "$f5" "$swap_pct"
+  v_hcp "$mem_pct_x"; hm=$HCP
+  v_fmt_mem $(( used - avail )); f1=$FMTM
+  v_fmt_mem "$used"; f2=$FMTM
+  v_fmt_mem "$avail"; f3=$FMTM
+  v_fmt_mem "$swap_used"; f4=$FMTM
+  v_fmt_mem "$stotal"; f5=$FMTM
+  local md=${MEM_DELTA_KIB:-0} msign="+" mcolor=$C_DIM
+  (( md < 0 )) && { msign="-"; md=$(( -md )); }
+  v_rate $(( md * 1024 )) "$ELAPSED_NS"
+  if (( RATE >= 10485760 )); then mcolor=$C_RED
+  elif (( RATE >= 1048576 )); then mcolor=$C_YELLOW
+  elif [[ $msign == "-" ]]; then mcolor=$C_GREEN; fi
+  v_fmt_mem $(( RATE / 1024 ))
+  add 'MEM   %s%s%%   %s / %s used   avail %s   swap %s / %s (%s%%)   %s%s%s' \
+    "$barm" "$hm" "$f1" "$f2" "$f3" "$f4" "$f5" "$swap_pct" \
+    "$mcolor" "$msign$FMTM/s" "$C_RESET"
   local vu vt gu gt
   gpu_sysfs_v; vu=$GPU_VU; vt=$GPU_VT; gu=$GPU_GU; gt=$GPU_GT
   local vram_pct=$(( vt ? 100 * vu / vt : 0 )) gtt_pct=$(( gt ? 100 * gu / gt : 0 ))
@@ -842,8 +867,8 @@ render_system() {
   local mpid mrss mrv msv
   while read -r mpid mrss; do
     [[ -n $mpid && $mrss =~ ^[0-9]+$ ]] || continue
-    v_fmt_kib "$mrss"; mrv=$FMTB
-    proc_swap_kb_v "$mpid"; v_fmt_kib "$SWAP_KB"; msv=$FMTB
+    v_fmt_mem "$mrss"; mrv=$FMTM
+    proc_swap_kb_v "$mpid"; v_fmt_mem "$SWAP_KB"; msv=$FMTM
     proc_label_v "$mpid"
     add '  %-8s %10s %10s  %s' "$mpid" "$mrv" "$msv" "$LABEL"
   done < <(ps -eo pid=,rss= --sort=-rss 2>/dev/null | head -n "$ROWS_MEM")
@@ -975,8 +1000,8 @@ render_proc() {
   v_pct10 "$dt" "$e"; cpu_pct=$PCT10
   if (( BARS )); then v_bar $(( dt * 100 / e )) 12; barp="$BAR "; fi
   proc_label_v "$pid"; local plabel=$LABEL
-  rss_kb_v "$pid"; local rssv; v_fmt_kib "$RSS_KB"; rssv=$FMTB
-  local swap_kb; swap_kb=$(proc_swap_kb "$pid"); v_fmt_kib "${swap_kb:-0}"; local swapv=$FMTB
+  rss_kb_v "$pid"; local rssv; v_fmt_mem "$RSS_KB"; rssv=$FMTM
+  local swap_kb; swap_kb=$(proc_swap_kb "$pid"); v_fmt_mem "${swap_kb:-0}"; local swapv=$FMTM
   v_hcp "$cpu_pct"; local hcpu=$HCP
   v_cores2 "$dt" "$e"; local cores2v=$CORES2
   add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s' \
@@ -985,24 +1010,24 @@ render_proc() {
   read_smaps_v "$pid"
   if (( SMAPS_RSS > 0 )); then
     local m1 m2 m3 m4 m5 m6
-    v_fmt_kib "$SMAPS_RSS"; m1=$FMTB
-    v_fmt_kib "$SMAPS_ANON"; m2=$FMTB
-    v_fmt_kib "$SMAPS_SHARED"; m3=$FMTB
-    v_fmt_kib "$SMAPS_PRIVATE"; m4=$FMTB
-    v_fmt_kib "$SMAPS_PSS"; m5=$FMTB
-    v_fmt_kib "$SMAPS_SWAP"; m6=$FMTB
+    v_fmt_mem "$SMAPS_RSS"; m1=$FMTM
+    v_fmt_mem "$SMAPS_ANON"; m2=$FMTM
+    v_fmt_mem "$SMAPS_SHARED"; m3=$FMTM
+    v_fmt_mem "$SMAPS_PRIVATE"; m4=$FMTM
+    v_fmt_mem "$SMAPS_PSS"; m5=$FMTM
+    v_fmt_mem "$SMAPS_SWAP"; m6=$FMTM
     add 'MEM   rss %s (anon %s, shared %s, private %s)   pss %s   swap %s' "$m1" "$m2" "$m3" "$m4" "$m5" "$m6"
   fi
   read_status_mem_v "$pid"
   if (( STA_VIRT > 0 )); then
     local s1 s2 s3 s4 s5 s6 s7
-    v_fmt_kib "$STA_VIRT"; s1=$FMTB
-    v_fmt_kib "$STA_PEAK"; s2=$FMTB
-    v_fmt_kib "$STA_DATA"; s3=$FMTB
-    v_fmt_kib "$STA_STK"; s4=$FMTB
-    v_fmt_kib "$STA_EXE"; s5=$FMTB
-    v_fmt_kib "$STA_LIB"; s6=$FMTB
-    v_fmt_kib "$STA_PTE"; s7=$FMTB
+    v_fmt_mem "$STA_VIRT"; s1=$FMTM
+    v_fmt_mem "$STA_PEAK"; s2=$FMTM
+    v_fmt_mem "$STA_DATA"; s3=$FMTM
+    v_fmt_mem "$STA_STK"; s4=$FMTM
+    v_fmt_mem "$STA_EXE"; s5=$FMTM
+    v_fmt_mem "$STA_LIB"; s6=$FMTM
+    v_fmt_mem "$STA_PTE"; s7=$FMTM
     add 'MEM   virt %s   peak %s   data %s   stack %s   exe %s   lib %s   pte %s' "$s1" "$s2" "$s3" "$s4" "$s5" "$s6" "$s7"
   fi
   add '%sTHREADS%s  (top 5 by CPU; 100%% = one core)' "$C_BOLD" "$C_RESET"
@@ -1067,8 +1092,8 @@ render_proc() {
   local shcpu sc2 smem sswap stc stg
   v_hcp "$sb_pct"; shcpu=$HCP
   v_cores2 "$sbusy" "$e"; sc2=$CORES2
-  v_fmt_kib "$MEM_AVAIL"; smem=$FMTB
-  v_fmt_kib $(( SWAP_TOTAL - SWAP_FREE )); sswap=$FMTB
+  v_fmt_mem "$MEM_AVAIL"; smem=$FMTM
+  v_fmt_mem $(( SWAP_TOTAL - SWAP_FREE )); sswap=$FMTM
   read_temp_v "$HWM_CPU"; v_temp "$TEMP"; stc=$TEMPC
   read_temp_v "$HWM_GPU"; v_temp "$TEMP"; stg=$TEMPC
   add 'SYS   CPU %s%% (%s/%s)   RAM avail %s   swap %s   TEMP CPU %s GPU %s' \
@@ -1110,6 +1135,10 @@ while :; do
   fi
   CUR_NS=$(date +%s%N)
   ELAPSED_NS=$(( CUR_NS - PRE_NS )); (( ELAPSED_NS > 0 )) || ELAPSED_NS=1000000000
+  read_mem
+  MEM_USED_KIB=$(( MEM_TOTAL - MEM_AVAIL ))
+  if [[ -n ${PRE_MEM_KIB:-} ]]; then MEM_DELTA_KIB=$(( MEM_USED_KIB - PRE_MEM_KIB )); else MEM_DELTA_KIB=0; fi
+  PRE_MEM_KIB=$MEM_USED_KIB
   if [[ -z $TARGET ]]; then
     ENG_DELTA=(); ENG_TOTAL=()
     for pid in "${CUR_GPU_PIDS[@]}"; do
