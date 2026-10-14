@@ -221,6 +221,7 @@ declare -A PRE_GPU_ENG CUR_GPU_ENG PRE_GPU_EV CUR_GPU_EV
 declare -A PRE_GPU_ENGINES CUR_GPU_ENGINES
 declare -A ENG_DELTA ENG_TOTAL
 declare -A LABEL_CACHE
+declare -A PROC_START
 declare -a GPU_PATHS=()
 GPU_PATH_AGE=999
 declare -A PRE_NET_RX CUR_NET_RX PRE_NET_TX CUR_NET_TX
@@ -266,9 +267,12 @@ snapshot_system() {  # $1=tag
 procs_snapshot() {  # $1=tag; one pass over every /proc/<pid>/stat
   local -n ticks="${1}_PROC_TICKS"
   ticks=()
-  local pid t
-  while read -r pid t; do
-    [[ -n $pid ]] && ticks[$pid]=$t
+  PROC_START=()
+  local pid t s
+  while read -r pid t s; do
+    [[ -n $pid ]] || continue
+    ticks[$pid]=$t
+    PROC_START[$pid]=$s
   done < <(grep -H '^' /proc/[0-9]*/stat 2>/dev/null | awk '
     {
       i=index($0,":"); path=substr($0,1,i-1); rest=substr($0,i+1)
@@ -277,7 +281,7 @@ procs_snapshot() {  # $1=tag; one pass over every /proc/<pid>/stat
       if (!j) next
       split(substr(rest,j+2), fs, /[ \t]+/)
       split(path, pa, "/")
-      printf "%s %d\n", pa[3], fs[12]+fs[13]
+      printf "%s %d %d\n", pa[3], fs[12]+fs[13], fs[20]+0
     }')
 }
 
@@ -694,6 +698,25 @@ v_fmt_mem() {  # $1 bytes? no: KiB -> adaptive precision (15.5G / 8.62G / 512M)
     FMTM="$s${kib}K"
   fi
 }
+
+fmt_uptime_v() {  # $1 seconds -> UPT ("2h13m" / "3d4h" / "45s")
+  local s=${1:-0}; (( s < 0 )) && s=0
+  if (( s >= 86400 )); then UPT="$(( s / 86400 ))d$(( s % 86400 / 3600 ))h"
+  elif (( s >= 3600 )); then UPT="$(( s / 3600 ))h$(( s % 3600 / 60 ))m"
+  elif (( s >= 60 )); then UPT="$(( s / 60 ))m"
+  else UPT="${s}s"; fi
+}
+proc_uptime_v() {  # $1=pid -> UPT from /proc starttime
+  local st=${PROC_START[$1]:-}
+  if [[ -z $st ]]; then
+    local stat rest f
+    IFS= read -r stat 2>/dev/null < /proc/"$1"/stat || { UPT="?"; return; }
+    rest=${stat#*) }
+    read -r -a f <<< "$rest"
+    st=${f[19]:-0}
+  fi
+  fmt_uptime_v $(( ${UPTIME_SECS:-0} - st / CLK_TCK ))
+}
 v_rate() {
   local d=${1:-0} ns=${2:-0} m=${3:-1} ms t
   if (( ns <= 0 )); then RATE=0; return; fi
@@ -934,7 +957,7 @@ render_system() {
   add 'TEMP  CPU %s   GPU %s   NVMe %s' "$tc" "$tg" "$tn"
   add ''
   add '%sTOP CPU%s  (last %ss)' "$C_BOLD" "$C_RESET" "$INTERVAL"
-  add '%s  %-8s %8s %10s  %s%s' "$C_DIM" PID CPU% RSS COMMAND "$C_RESET"
+  add '%s  %-8s %8s %10s %7s  %s%s' "$C_DIM" PID CPU% RSS UPTIME COMMAND "$C_RESET"
   local pid p10 pv ppad
   while read -r p10 pid; do
     [[ -n $pid ]] || continue
@@ -942,7 +965,8 @@ render_system() {
     v_hcp "$ppad"
     rss_kb_v "$pid"; v_fmt_kib "$RSS_KB"
     proc_label_v "$pid"
-    add '  %-8s %s %10s  %s' "$pid" "$HCP" "$FMTB" "$LABEL"
+    proc_uptime_v "$pid"
+    add '  %-8s %s %10s %7s  %s' "$pid" "$HCP" "$FMTB" "$UPT" "$LABEL"
   done < <(
     for pid in "${!CUR_PROC_TICKS[@]}"; do
       [[ -n ${PRE_PROC_TICKS[$pid]+x} ]] || continue
@@ -952,14 +976,15 @@ render_system() {
   )
   add ''
   add '%sTOP MEM%s  (RSS; swap shown for listed rows)' "$C_BOLD" "$C_RESET"
-  add '%s  %-8s %10s %10s  %s%s' "$C_DIM" PID RSS SWAP COMMAND "$C_RESET"
+  add '%s  %-8s %10s %10s %7s  %s%s' "$C_DIM" PID RSS SWAP UPTIME COMMAND "$C_RESET"
   local mpid mrss mrv msv
   while read -r mpid mrss; do
     [[ -n $mpid && $mrss =~ ^[0-9]+$ ]] || continue
     v_fmt_mem "$mrss"; mrv=$FMTM
     proc_swap_kb_v "$mpid"; v_fmt_mem "$SWAP_KB"; msv=$FMTM
     proc_label_v "$mpid"
-    add '  %-8s %10s %10s  %s' "$mpid" "$mrv" "$msv" "$LABEL"
+    proc_uptime_v "$mpid"
+    add '  %-8s %10s %10s %7s  %s' "$mpid" "$mrv" "$msv" "$UPT" "$LABEL"
   done < <(ps -eo pid=,rss= --sort=-rss 2>/dev/null | head -n "$ROWS_MEM")
   if (( GPU_TOP )) && (( ${#CUR_GPU_PIDS[@]} > 0 )); then
     add ''
@@ -971,10 +996,10 @@ render_system() {
     local use_engine=0; (( engine_total > 0 )) && use_engine=1
     if (( use_engine )); then
       add '%sTOP GPU%s  (engine busy, last %ss)' "$C_BOLD" "$C_RESET" "$INTERVAL"
-      add '%s  %-8s %8s %10s  %s%s' "$C_DIM" PID GPU% VRAM COMMAND "$C_RESET"
+      add '%s  %-8s %8s %10s %7s  %s%s' "$C_DIM" PID GPU% VRAM UPTIME COMMAND "$C_RESET"
     else
       add '%sTOP GPU%s  (by VRAM; no engine counters)' "$C_BOLD" "$C_RESET"
-      add '%s  %-8s %10s  %s%s' "$C_DIM" PID VRAM COMMAND "$C_RESET"
+      add '%s  %-8s %10s %7s  %s%s' "$C_DIM" PID VRAM UPTIME COMMAND "$C_RESET"
     fi
     local -a grows=()
     local gkey gv
@@ -1012,11 +1037,13 @@ render_system() {
         printf -v gpad '%8s' "$gpct"; v_hcp "$gpad"
         v_fmt_kib "${CUR_GPU_VRAM[$pid]:-0}"
         proc_label_v "$pid"
-        add '  %-8s %s %10s  %s' "$pid" "$HCP" "$FMTB" "$LABEL"
+        proc_uptime_v "$pid"
+        add '  %-8s %s %10s %7s  %s' "$pid" "$HCP" "$FMTB" "$UPT" "$LABEL"
       else
         v_fmt_kib "${CUR_GPU_VRAM[$pid]:-0}"
         proc_label_v "$pid"
-        add '  %-8s %10s  %s' "$pid" "$FMTB" "$LABEL"
+        proc_uptime_v "$pid"
+        add '  %-8s %10s %7s  %s' "$pid" "$FMTB" "$UPT" "$LABEL"
       fi
     done
   fi
@@ -1093,8 +1120,9 @@ render_proc() {
   local swap_kb; swap_kb=$(proc_swap_kb "$pid"); v_fmt_mem "${swap_kb:-0}"; local swapv=$FMTM
   v_hcp "$cpu_pct"; local hcpu=$HCP
   v_cores2 "$dt" "$e"; local cores2v=$CORES2
-  add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s' \
-    "$C_BOLD" "$plabel" "$C_RESET" "$pid" "$rssv" "$swapv" "${#CUR_THREAD_TICKS[@]}"
+  proc_uptime_v "$pid"
+  add 'PROC  %s%s%s (pid %s)   RSS %s   swap %s   threads %s   uptime %s' \
+    "$C_BOLD" "$plabel" "$C_RESET" "$pid" "$rssv" "$swapv" "${#CUR_THREAD_TICKS[@]}" "$UPT"
   add 'CPU   %s%s%% (%s cores of %s)' "$barp" "$hcpu" "$cores2v" "$ncores"
   read_smaps_v "$pid"
   if (( SMAPS_RSS > 0 )); then
@@ -1234,6 +1262,8 @@ while :; do
   fi
   CUR_NS=$(date +%s%N)
   ELAPSED_NS=$(( CUR_NS - PRE_NS )); (( ELAPSED_NS > 0 )) || ELAPSED_NS=1000000000
+  read -r UPTIME_SECS _ < /proc/uptime
+  UPTIME_SECS=${UPTIME_SECS%%.*}
   read_mem
   MEM_USED_KIB=$(( MEM_TOTAL - MEM_AVAIL ))
   if [[ -n ${PRE_MEM_KIB:-} ]]; then MEM_DELTA_KIB=$(( MEM_USED_KIB - PRE_MEM_KIB )); else MEM_DELTA_KIB=0; fi

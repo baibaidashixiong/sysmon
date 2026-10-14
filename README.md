@@ -118,6 +118,7 @@ MEM   commit 39.2G / 26.8G (146%)   swapcached 438M   swap in/out 0.0B/s / 0.0B/
 | `NET` | 各网卡的实时收发速率；只显示有流量的网卡，默认路由网卡空闲时也会显示 |
 | `TOP GPU` | 按 GPU 引擎占用排序的前 5 个进程，附各自的显存占用；无引擎计数器时按显存排序 |
 | `TOP MEM` | 按 RSS 排序的前几个进程，并列出各自的 swap 用量 |
+| `UPTIME` | 进程已运行时间（`45s` / `12m` / `2h13m` / `3d4h`），来自 `/proc/<pid>/stat` 的 starttime，无需额外权限 |
 | `ENGINE` | 各 GPU 引擎的整机占用（3D、视频解码、编码等），仅显示有活动的引擎 |
 
 ### 进程模式
@@ -137,6 +138,7 @@ MEM   commit 39.2G / 26.8G (146%)   swapcached 438M   swap in/out 0.0B/s / 0.0B/
 | `RSS` / `swap` | 物理内存 / 已换出的进程内存 |
 | `NET` | 该进程持有的套接字总数，以及其中 TCP 已建立、监听和 UDP 的数量 |
 | `MEM` | 该进程 `rss`（含 anon/shared/private 构成）、`pss`、`swap`；下一行是 `virt`/`peak`/`data`/`stack`/`exe`/`lib`/`pte` 明细 |
+| `uptime` | 该进程已运行时间，可用于区分"刚启动"和"跑了很久"的进程 |
 
 > `COMMAND` / `PROC` / `THREADS` 里的名字来自 `/proc/<pid>/comm`，
 > 这是程序自己可以改的标签（最长 15 字符），并不一定是可执行文件名。

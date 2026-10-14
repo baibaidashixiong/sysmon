@@ -51,6 +51,8 @@ grep -q '^NET' <<<"$out"
 report $? 'process mode reports NET sockets'
 grep -q '^MEM' <<<"$out"
 report $? 'process mode reports memory detail'
+grep -q 'uptime ' <<<"$out"
+report $? 'process mode reports uptime'
 
 ./sysmon.sh -i 1 -n 1 -p NoSuchProcessXyz >/dev/null 2>&1
 [[ $? -ne 0 ]]
